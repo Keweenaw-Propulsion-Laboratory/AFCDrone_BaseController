@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AERE Drone Serial Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">A</div>
+        <div>
+          <h1>AERE Drone Serial Dashboard</h1>
+          <p>Telemetry, commands, packets, and debug output</p>
+        </div>
+      </div>
+      <div class="connection-controls">
+        <label class="compact-field port-field">
+          <span>Server port</span>
+          <select id="serial-port">
+            <option value="">Waiting for server...</option>
+          </select>
+        </label>
+        <button id="refresh-ports" class="secondary" type="button">Refresh Ports</button>
+        <label class="compact-field">
+          <span>Baud</span>
+          <select id="baud-rate">
+            <option>9600</option>
+            <option>57600</option>
+            <option selected>115200</option>
+            <option>230400</option>
+            <option>460800</option>
+            <option>921600</option>
+          </select>
+        </label>
+        <button id="demo-button" class="secondary" type="button">Demo Data</button>
+        <button id="connect-button" class="primary" type="button" disabled>Connect Serial</button>
+        <div id="connection-badge" class="connection-badge"><span id="connection-dot" class="status-dot"></span>Server Offline</div>
+      </div>
+    </header>
+
+    <div id="server-warning" class="warning-banner">
+      The browser is not connected to the dashboard server. Start <code>server.py</code> and open this page from that server.
+    </div>
+
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="tab-button active" data-tab="dashboard" type="button">Dashboard</button>
+      <button class="tab-button" data-tab="commands" type="button">Commands</button>
+      <button class="tab-button" data-tab="packets" type="button">Packets</button>
+      <button class="tab-button" data-tab="terminal" type="button">Debug Terminal</button>
+    </nav>
+
+    <main>
+      <section id="tab-dashboard" class="tab-panel active">
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span class="metric-label">Connection</span>
+            <strong id="metric-connection">Server Offline</strong>
+            <small id="metric-connection-detail">No server bridge</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Packet rate</span>
+            <strong id="metric-packet-rate">0 pkt/s</strong>
+            <small>Latest one-second window</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Average loop</span>
+            <strong id="metric-loop-avg">-- us</strong>
+            <small id="metric-loop-max">Max -- us</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">RSSI</span>
+            <strong id="metric-rssi">--</strong>
+            <small>Raw firmware value</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Mode</span>
+            <strong id="metric-mode">--</strong>
+            <small>Numeric Drone::state</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Runtime</span>
+            <strong id="metric-runtime">00:00:00</strong>
+            <small>16-bit seconds</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Motor setpoints</span>
+            <strong id="metric-motors">-- / --</strong>
+            <small>Bottom / top</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Gimbal</span>
+            <strong id="metric-gimbal">-- / --</strong>
+            <small>Pitch / yaw</small>
+          </article>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="panel chart-panel">
+            <div class="panel-heading chart-heading">
+              <div>
+                <h2>Control loop</h2>
+                <p>Average and maximum loop time</p>
+              </div>
+              <div class="chart-heading-controls">
+                <div class="legend"><span class="legend-dot accent"></span>Average <span class="legend-dot warning"></span>Maximum</div>
+                <label class="compact-field chart-window-field">
+                  <span>Time span</span>
+                  <select class="chart-window-select" aria-label="Control loop graph time span">
+                    <option value="10000">10 seconds</option>
+                    <option value="30000" selected>30 seconds</option>
+                    <option value="60000">1 minute</option>
+                    <option value="300000">5 minutes</option>
+                    <option value="900000">15 minutes</option>
+                    <option value="1800000">30 minutes</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="chart-readout" aria-live="polite">
+              <span><span class="legend-dot accent"></span>Average <strong id="loop-chart-latest-avg">-- us</strong></span>
+              <span><span class="legend-dot warning"></span>Maximum <strong id="loop-chart-latest-max">-- us</strong></span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="loop-chart" class="chart" aria-label="Control loop history"></canvas>
+              <div class="chart-hover-line" aria-hidden="true"></div>
+              <div class="chart-tooltip" role="tooltip" hidden></div>
+            </div>
+          </article>
+
+          <article class="panel chart-panel">
+            <div class="panel-heading chart-heading">
+              <div>
+                <h2>Radio signal</h2>
+                <p>Recent RSSI history</p>
+              </div>
+              <div class="chart-heading-controls">
+                <span class="subtle">Last telemetry: <span id="last-telemetry-age">Never</span></span>
+                <label class="compact-field chart-window-field">
+                  <span>Time span</span>
+                  <select class="chart-window-select" aria-label="RSSI graph time span">
+                    <option value="10000">10 seconds</option>
+                    <option value="30000" selected>30 seconds</option>
+                    <option value="60000">1 minute</option>
+                    <option value="300000">5 minutes</option>
+                    <option value="900000">15 minutes</option>
+                    <option value="1800000">30 minutes</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="chart-readout" aria-live="polite">
+              <span><span class="legend-dot accent"></span>RSSI <strong id="rssi-chart-latest">--</strong></span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="rssi-chart" class="chart" aria-label="RSSI history"></canvas>
+              <div class="chart-hover-line" aria-hidden="true"></div>
+              <div class="chart-tooltip" role="tooltip" hidden></div>
+            </div>
+          </article>
+        </div>
+
+        <article class="panel map-panel">
+          <div class="panel-heading map-heading">
+            <div>
+              <h2>Flight position</h2>
+              <p>Satellite imagery centered on the latest telemetry coordinates</p>
+            </div>
+            <div class="map-controls">
+              <label class="switch-row"><input id="map-follow" type="checkbox" checked><span>Follow drone</span></label>
+              <button id="map-recenter" class="secondary small" type="button" disabled>Recenter</button>
+              <button id="map-clear-trail" class="secondary small" type="button">Clear trail</button>
+            </div>
+          </div>
+          <div class="map-stats" aria-live="polite">
+            <span>Latitude <strong id="map-latitude">--</strong></span>
+            <span>Longitude <strong id="map-longitude">--</strong></span>
+            <span>Zoom <strong id="map-zoom">22</strong></span>
+          </div>
+          <div id="telemetry-map" class="telemetry-map" role="region" aria-label="Satellite map showing the latest drone position">
+            <div id="map-status" class="map-status">Waiting for a non-zero GPS position</div>
+          </div>
+          <p class="map-note">Map tiles load directly in each browser. Zoom 22 may digitally enlarge the highest-resolution imagery available for the location.</p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Latest telemetry</h2>
+              <p>Decoded from the packed 54-byte telemetry structure</p>
+            </div>
+            <div class="stats-inline">
+              <span>RX <strong id="metric-rx">0</strong></span>
+              <span>TX <strong id="metric-tx">0</strong></span>
+              <span>Parse errors <strong id="metric-errors">0</strong></span>
+              <span>Voltage <strong id="metric-voltage">--</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>Group</th><th>Field</th><th>Value</th><th>Unit</th></tr></thead>
+              <tbody id="telemetry-table-body">
+                <tr><td colspan="4" class="empty-state">Waiting for telemetry</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="tab-commands" class="tab-panel">
+        <div class="command-layout">
+          <article class="panel command-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Drone command</h2>
+                <p>Matches the current packed <code>usb_command_t</code> payload</p>
+              </div>
+              <button id="emergency-stop" class="danger" type="button">Stop Motors</button>
+            </div>
+
+            <div class="form-grid">
+              <fieldset class="field-group">
+                <legend>Target slot</legend>
+                <label class="radio-row"><input type="radio" name="target-slot" value="0" checked> Slot 0</label>
+                <label class="radio-row"><input type="radio" name="target-slot" value="1"> Slot 1</label>
+              </fieldset>
+              <fieldset class="field-group">
+                <legend>Active slot</legend>
+                <label class="radio-row"><input type="radio" name="active-slot" value="0" checked> Slot 0</label>
+                <label class="radio-row"><input type="radio" name="active-slot" value="1"> Slot 1</label>
+              </fieldset>
+
+              <label class="field field-span-2">
+                <span>Gimbal X</span>
+                <div class="range-pair"><input id="gimbal-x" type="range" min="-32768" max="32767" value="0"><input id="gimbal-x-number" type="number" min="-32768" max="32767" value="0"></div>
+              </label>
+              <label class="field field-span-2">
+                <span>Gimbal Y</span>
+                <div class="range-pair"><input id="gimbal-y" type="range" min="-32768" max="32767" value="0"><input id="gimbal-y-number" type="number" min="-32768" max="32767" value="0"></div>
+              </label>
+              <label class="field field-span-2">
+                <span>Motor 0 speed</span>
+                <div class="range-pair"><input id="motor-0" type="range" min="0" max="255" value="0"><input id="motor-0-number" type="number" min="0" max="255" value="0"></div>
+              </label>
+              <label class="field field-span-2">
+                <span>Motor 1 speed</span>
+                <div class="range-pair"><input id="motor-1" type="range" min="0" max="255" value="0"><input id="motor-1-number" type="number" min="0" max="255" value="0"></div>
+              </label>
+            </div>
+
+            <div class="safety-strip">
+              <label class="switch-row"><input id="motor-enable" type="checkbox"><span>Enable nonzero motor output</span></label>
+              <p>When disabled, transmitted motor fields are forced to zero.</p>
+            </div>
+
+            <div class="command-footer">
+              <div class="live-controls">
+                <label class="switch-row"><input id="live-send" type="checkbox"><span>Continuous send</span></label>
+                <label class="compact-field"><span>Rate</span><input id="live-rate" type="number" min="1" max="50" value="10"><span>Hz</span></label>
+              </div>
+              <div class="send-area">
+                <span id="last-command-status" class="subtle">No command sent</span>
+                <button id="send-command" class="primary" type="button">Send Command</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Generic packet builder</h2>
+                <p>Forms are generated from <code>PACKET_SCHEMAS</code></p>
+              </div>
+            </div>
+            <label class="field">
+              <span>Outbound schema</span>
+              <select id="schema-select"></select>
+            </label>
+            <div id="schema-fields" class="form-grid schema-fields"></div>
+            <div class="packet-preview">
+              <span>Payload preview</span>
+              <code id="builder-preview">Generated after send</code>
+            </div>
+            <button id="send-generic" class="primary full-width" type="button">Encode and Send</button>
+          </article>
+        </div>
+      </section>
+
+      <section id="tab-packets" class="tab-panel">
+        <article class="panel">
+          <div class="panel-heading packet-toolbar">
+            <div>
+              <h2>Packet monitor</h2>
+              <p>Decoded packets and raw payload bytes</p>
+            </div>
+            <div class="toolbar-actions">
+              <label class="compact-field"><span>Show</span><select id="packet-filter"><option value="all">All</option><option value="rx">RX</option><option value="tx">TX</option></select></label>
+              <button id="export-packets" class="secondary" type="button">Export JSON</button>
+              <button id="clear-packets" class="secondary" type="button">Clear</button>
+            </div>
+          </div>
+          <label class="compatibility-option"><input id="compat-telemetry" type="checkbox" checked><span>Treat 54-byte DEBUG_TEXT packets as telemetry until the firmware type-field bug is fixed</span></label>
+          <div class="table-wrap">
+            <table class="data-table packet-table">
+              <thead><tr><th>Time</th><th>Dir</th><th>#</th><th>Type</th><th>Bytes</th><th>Summary</th><th></th></tr></thead>
+              <tbody id="packet-table-body"><tr><td colspan="7" class="empty-state">No packets received</td></tr></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="tab-terminal" class="tab-panel">
+        <article class="panel terminal-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Debug terminal</h2>
+              <p>UTF-8 payloads from DEBUG_TEXT packets and connection events</p>
+            </div>
+            <button id="clear-terminal" class="secondary" type="button">Clear</button>
+          </div>
+          <div id="terminal-output" class="terminal-output" aria-live="polite"></div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="packet-dialog" class="packet-dialog">
+    <div class="dialog-heading">
+      <div><h2 id="packet-dialog-title">Packet</h2><p id="packet-dialog-meta"></p></div>
+      <button id="packet-dialog-close" class="secondary" type="button">Close</button>
+    </div>
+    <h3>Complete frame</h3>
+    <pre id="packet-dialog-frame"></pre>
+    <h3>Payload bytes</h3>
+    <pre id="packet-dialog-hex"></pre>
+    <h3>Decoded values</h3>
+    <pre id="packet-dialog-decoded"></pre>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
