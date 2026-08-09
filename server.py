@@ -210,6 +210,10 @@ async def stylesheet_handler(_: web.Request) -> web.FileResponse:
     return web.FileResponse(ROOT / "styles.css")
 
 
+async def logo_handler(_: web.Request) -> web.FileResponse:
+    return web.FileResponse(ROOT / "Aere.png")
+
+
 async def ports_handler(request: web.Request) -> web.Response:
     bridge: SerialBridge = request.app["bridge"]
     return web.json_response({"ports": bridge.ports(), "status": bridge.status()})
@@ -272,10 +276,12 @@ def build_app(loop: asyncio.AbstractEventLoop) -> web.Application:
     app.router.add_get("/", index_handler)
     app.router.add_get("/index.html", index_handler)
     app.router.add_get("/styles.css", stylesheet_handler)
+    app.router.add_get("/Aere.png", logo_handler)
     app.router.add_get("/api/serial/ports", ports_handler)
     app.router.add_get("/api/serial/status", status_handler)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_static("/src", ROOT / "src", show_index=False)
+    app.router.add_static("/assets", ROOT / "assets", show_index=False)
     app.on_cleanup.append(on_cleanup)
     return app
 

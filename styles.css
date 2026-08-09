@@ -44,15 +44,10 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 }
 .brand { display: flex; align-items: center; gap: 14px; min-width: 260px; }
 .brand-mark {
-  display: grid;
-  place-items: center;
   width: 42px;
   height: 42px;
-  border-radius: 12px;
-  background: var(--accent);
-  color: #07111a;
-  font-size: 1.3rem;
-  font-weight: 900;
+  object-fit: contain;
+  border-radius: 50%;
 }
 h1, h2, h3, p { margin: 0; }
 h1 { font-size: clamp(1.15rem, 2vw, 1.5rem); }
@@ -85,6 +80,21 @@ h3 { margin-top: 18px; font-size: .9rem; color: var(--muted); }
 .status-dot.online { background: var(--success); box-shadow: 0 0 0 4px rgba(70, 213, 154, .12); }
 .connection-badge.connected { color: var(--success); }
 
+.link-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-2);
+  font-size: .82rem;
+  white-space: nowrap;
+}
+.link-mode-badge.direct { color: var(--accent); border-color: rgba(66, 184, 255, .35); }
+.link-mode-badge.relay { color: var(--success); border-color: rgba(70, 213, 154, .35); }
+.link-mode-badge.unknown { color: var(--warning); border-color: rgba(255, 190, 85, .4); }
+
 button {
   border: 1px solid transparent;
   border-radius: 10px;
@@ -114,7 +124,7 @@ button.full-width { width: 100%; margin-top: 16px; }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
-.metric-grid { display: grid; grid-template-columns: repeat(8, minmax(135px, 1fr)); gap: 12px; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 12px; }
 .metric-card {
   min-height: 112px;
   padding: 15px;
@@ -262,6 +272,32 @@ button.full-width { width: 100%; margin-top: 16px; }
 .packet-preview span { display: block; margin-bottom: 7px; color: var(--muted); font-size: .76rem; }
 .packet-preview code { display: block; white-space: pre-wrap; word-break: break-all; color: #d9ecff; }
 
+.config-warning { margin: 0 0 16px; }
+.config-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.config-table .config-effect { color: var(--muted); max-width: 320px; }
+.config-input-cell input[type="number"] {
+  width: 110px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+.config-input-cell input[type="number"].invalid { border-color: var(--danger); }
+.config-input-cell input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.config-status {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: .74rem;
+  font-weight: 700;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.config-status.ok { background: rgba(70, 213, 154, .14); color: var(--success); }
+.config-status.error { background: rgba(255, 101, 119, .14); color: var(--danger); }
+.config-status.pending { background: var(--accent-soft); color: var(--accent); }
+
 .packet-toolbar { align-items: center; }
 .toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .direction-pill { display: inline-block; min-width: 32px; text-align: center; border-radius: 999px; padding: 3px 7px; font-size: .7rem; font-weight: 800; }
@@ -367,6 +403,53 @@ button.full-width { width: 100%; margin-top: 16px; }
 .map-status.has-fix { color: var(--success); }
 .map-status.error { color: #ff9aa6; border-color: rgba(255, 101, 119, .48); }
 .map-note { margin-top: 9px; color: var(--muted); font-size: .75rem; }
+
+.orientation-panel { overflow: hidden; }
+.orientation-readouts {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: .8rem;
+}
+.orientation-readouts strong { color: var(--text); font-family: "SFMono-Regular", Consolas, monospace; }
+.orientation-canvas {
+  position: relative;
+  width: 100%;
+  height: 480px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0b1018;
+}
+.orientation-canvas canvas { display: block; width: 100%; height: 100%; }
+.orientation-status {
+  position: absolute;
+  z-index: 5;
+  left: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 9px;
+  background: rgba(7, 11, 17, .82);
+  color: var(--text);
+  font-size: .78rem;
+  pointer-events: none;
+  backdrop-filter: blur(5px);
+}
+.orientation-status.error { color: #ff9aa6; border-color: rgba(255, 101, 119, .48); }
+.orientation-status.hidden { display: none; }
+.orientation-legend {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: .8rem;
+}
+.orientation-legend > span { display: inline-flex; align-items: center; gap: 7px; }
+.orientation-legend strong { color: var(--text); font-family: "SFMono-Regular", Consolas, monospace; }
 .telemetry-map .leaflet-control-attribution {
   background: rgba(7, 11, 17, .78);
   color: #d8e2ee;

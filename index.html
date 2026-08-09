@@ -7,12 +7,19 @@
   <title>AERE Drone Serial Dashboard</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
   <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js"
+      }
+    }
+  </script>
 </head>
 <body>
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">A</div>
+        <img class="brand-mark" src="Aere.png" alt="" aria-hidden="true">
         <div>
           <h1>AERE Drone Serial Dashboard</h1>
           <p>Telemetry, commands, packets, and debug output</p>
@@ -40,6 +47,7 @@
         <button id="demo-button" class="secondary" type="button">Demo Data</button>
         <button id="connect-button" class="primary" type="button" disabled>Connect Serial</button>
         <div id="connection-badge" class="connection-badge"><span id="connection-dot" class="status-dot"></span>Server Offline</div>
+        <span id="link-mode-status" class="link-mode-badge">Link: Not connected</span>
       </div>
     </header>
 
@@ -50,7 +58,9 @@
     <nav class="tabs" aria-label="Dashboard sections">
       <button class="tab-button active" data-tab="dashboard" type="button">Dashboard</button>
       <button class="tab-button" data-tab="commands" type="button">Commands</button>
+      <button class="tab-button" data-tab="config" type="button">Config</button>
       <button class="tab-button" data-tab="packets" type="button">Packets</button>
+      <button class="tab-button" data-tab="orientation" type="button">3D View</button>
       <button class="tab-button" data-tab="terminal" type="button">Debug Terminal</button>
     </nav>
 
@@ -75,12 +85,17 @@
           <article class="metric-card">
             <span class="metric-label">RSSI</span>
             <strong id="metric-rssi">--</strong>
-            <small>Raw firmware value</small>
+            <small>Drone's self-reported uplink</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Downlink RSSI</span>
+            <strong id="metric-downlink-rssi">--</strong>
+            <small>Base station's own reading (relay only)</small>
           </article>
           <article class="metric-card">
             <span class="metric-label">Mode</span>
             <strong id="metric-mode">--</strong>
-            <small>Numeric Drone::state</small>
+            <small>Drone::state</small>
           </article>
           <article class="metric-card">
             <span class="metric-label">Runtime</span>
@@ -235,12 +250,12 @@
               </fieldset>
 
               <label class="field field-span-2">
-                <span>Gimbal X</span>
-                <div class="range-pair"><input id="gimbal-x" type="range" min="-32768" max="32767" value="0"><input id="gimbal-x-number" type="number" min="-32768" max="32767" value="0"></div>
+                <span>Gimbal X (deg)</span>
+                <div class="range-pair"><input id="gimbal-x" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-x-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Gimbal Y</span>
-                <div class="range-pair"><input id="gimbal-y" type="range" min="-32768" max="32767" value="0"><input id="gimbal-y-number" type="number" min="-32768" max="32767" value="0"></div>
+                <span>Gimbal Y (deg)</span>
+                <div class="range-pair"><input id="gimbal-y" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-y-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
                 <span>Motor 0 speed</span>
@@ -290,6 +305,33 @@
         </div>
       </section>
 
+      <section id="tab-config" class="tab-panel">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <h2>Persistent configuration</h2>
+              <p>EEPROM-backed settings, matched to the <code>usb_config_request</code>/<code>usb_config_response</code> layout (type 5)</p>
+            </div>
+            <span id="config-sync-status" class="subtle">Never synced</span>
+          </div>
+
+          <p class="warning-banner config-warning">Configuration changes are rejected while the vehicle is in <code>FLIGHT</code>.</p>
+
+          <div class="config-toolbar">
+            <button id="config-read" class="secondary" type="button">Read Current Values</button>
+            <button id="config-apply" class="primary" type="button">Apply Changes</button>
+            <button id="config-zero-all" class="danger" type="button">Reset to Defaults</button>
+          </div>
+
+          <div class="table-wrap">
+            <table class="data-table config-table">
+              <thead><tr><th>Setting</th><th>Effect</th><th>Current</th><th>New value</th><th>Status</th></tr></thead>
+              <tbody id="config-table-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
       <section id="tab-packets" class="tab-panel">
         <article class="panel">
           <div class="panel-heading packet-toolbar">
@@ -310,6 +352,30 @@
               <tbody id="packet-table-body"><tr><td colspan="7" class="empty-state">No packets received</td></tr></tbody>
             </table>
           </div>
+        </article>
+      </section>
+
+      <section id="tab-orientation" class="tab-panel">
+        <article class="panel orientation-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>3D orientation</h2>
+              <p>Live attitude from the gyro, plus world-frame velocity and acceleration</p>
+            </div>
+            <div class="orientation-readouts">
+              <span>Roll <strong id="orientation-roll">--</strong></span>
+              <span>Pitch <strong id="orientation-pitch">--</strong></span>
+              <span>Yaw <strong id="orientation-yaw">--</strong></span>
+            </div>
+          </div>
+          <div id="orientation-canvas" class="orientation-canvas">
+            <div id="orientation-status" class="orientation-status">Loading 3D model...</div>
+          </div>
+          <div class="orientation-legend">
+            <span><span class="legend-dot accent"></span>Velocity <strong id="orientation-velocity">-- m/s</strong></span>
+            <span><span class="legend-dot warning"></span>Acceleration <strong id="orientation-accel">-- m/s²</strong></span>
+          </div>
+          <p class="map-note">Drag to orbit, scroll to zoom. Vectors are world-frame, not rotated with the model.</p>
         </article>
       </section>
 
