@@ -128,14 +128,15 @@ export const CONFIG_READ_ENTRY_MAX = 8;
 export const CONFIG_SET_ENTRY_MAX = 9;
 
 export const CONFIG_KEYS = Object.freeze([
-  { id: 0, key: 'TxPowerDbm', label: 'Tx power', kind: 'int', min: 14, max: 20, default: 20, unit: 'dBm', effect: 'RFM69 transmit power in dBm.' },
-  { id: 1, key: 'UsbRelayEnabled', label: 'USB relay enabled', kind: 'bool', default: 1, effect: 'Enables USB communication handling.' },
-  { id: 2, key: 'RadioEnabled', label: 'Radio enabled', kind: 'bool', default: 1, effect: 'Enables periodic radio processing.' },
-  { id: 3, key: 'SkipRadioHandshake', label: 'Skip radio handshake', kind: 'bool', default: 1, effect: 'Skips the radio connection handshake when enabled.' },
-  { id: 4, key: 'GimbalPitchOffset', label: 'Gimbal pitch offset', kind: 'int', min: 60, max: 120, default: 90, unit: 'deg', effect: 'Pitch-servo center/setpoint offset in degrees.' },
-  { id: 5, key: 'GimbalYawOffset', label: 'Gimbal yaw offset', kind: 'int', min: 60, max: 120, default: 89, unit: 'deg', effect: 'Yaw-servo center/setpoint offset in degrees.' },
-  { id: 6, key: 'Motor1Offset', label: 'Motor 1 offset (top)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Top-motor speed adjustment.' },
-  { id: 7, key: 'Motor2Offset', label: 'Motor 2 offset (bottom)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Bottom-motor speed adjustment.' },
+  { id: 0, key: 'DebugMode', label: 'Debug Mode', kind: 'bool', default: 0, effect: 'Enables increased debug logging.'},
+  { id: 1, key: 'TxPowerDbm', label: 'Tx power', kind: 'int', min: 14, max: 20, default: 20, unit: 'dBm', effect: 'RFM69 transmit power in dBm.' },
+  { id: 2, key: 'UsbRelayEnabled', label: 'USB relay enabled', kind: 'bool', default: 1, effect: 'Enables USB communication handling.' },
+  { id: 3, key: 'RadioEnabled', label: 'Radio enabled', kind: 'bool', default: 1, effect: 'Enables periodic radio processing.' },
+  { id: 4, key: 'SkipRadioHandshake', label: 'Skip radio handshake', kind: 'bool', default: 1, effect: 'Skips the radio connection handshake when enabled.' },
+  { id: 5, key: 'GimbalPitchOffset', label: 'Gimbal pitch offset', kind: 'int', min: 60, max: 120, default: 90, unit: 'deg', effect: 'Pitch-servo center/setpoint offset in degrees.' },
+  { id: 6, key: 'GimbalYawOffset', label: 'Gimbal yaw offset', kind: 'int', min: 60, max: 120, default: 89, unit: 'deg', effect: 'Yaw-servo center/setpoint offset in degrees.' },
+  { id: 7, key: 'Motor1Offset', label: 'Motor 1 offset (top)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Top-motor speed adjustment.' },
+  { id: 8, key: 'Motor2Offset', label: 'Motor 2 offset (bottom)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Bottom-motor speed adjustment.' },
 ]);
 
 export function getConfigKeyById(id) {
@@ -236,8 +237,8 @@ const RADIO_STATUS_SCHEMAS = {
       { key: 'loopTimeAvg', type: 'uint16' },
       { key: 'loopTimeMax', type: 'uint16' },
       { key: 'runTime', type: 'uint16' },
-      { key: 'rssi', type: 'uint8' },
       { key: 'currentMode', type: 'uint8' },
+      { key: 'reserved' , type: 'uint8', hidden: true},
     ],
   },
   [RADIO_MESSAGE_TYPES.STATUS1]: {
@@ -255,7 +256,7 @@ const RADIO_STATUS_SCHEMAS = {
       { key: 'motor1Set', type: 'uint16' },
       { key: 'motor2Set', type: 'uint16' },
       { key: 'voltage', type: 'uint16' },
-      { key: 'reserved', type: 'uint16', hidden: true },
+      { key: 'rssi', type: 'uint16' },
     ],
   },
   // Quaternion components are Q15 fixed-point (already normalized to
