@@ -2,7 +2,7 @@ import {
   RADIO_MESSAGE_TYPES,
   USB_MESSAGE_TYPES,
   CONFIG_OPS,
-  PROTOCOL_VERSION,
+  CONFIG_VERSION,
   encodeRadioMessage,
   encodePayload,
   getSchemaById,
@@ -21,7 +21,7 @@ export function encodeRadioCommandEnvelope(commandValues) {
 
 export function encodeRadioConfigEnvelope(operation, key, value = 0) {
   const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, {
-    version: PROTOCOL_VERSION,
+    version: CONFIG_VERSION,
     state: operation,
     configKey: key,
     value,
@@ -42,9 +42,6 @@ export function applyRadioStatusToTelemetry(telemetry, radioMessageType, decoded
       telemetry.loopTimeMax = decodedMessage.loopTimeMax;
       telemetry.runTime = decodedMessage.runTime;
       telemetry.currentMode = decodedMessage.currentMode;
-      // The drone's own self-reported uplink RSSI - distinct from the base
-      // station's downlink RSSI, which comes from the RADIO_PACKET envelope.
-      telemetry.rssi = decodedMessage.rssi;
       break;
     case RADIO_MESSAGE_TYPES.STATUS1:
       telemetry.gimbalPitch = decodedMessage.gimbalPitch;
@@ -56,6 +53,10 @@ export function applyRadioStatusToTelemetry(telemetry, radioMessageType, decoded
       telemetry.motor1Set = decodedMessage.motor1Set;
       telemetry.motor2Set = decodedMessage.motor2Set;
       telemetry.voltage = decodedMessage.voltage;
+      // The drone's own self-reported uplink RSSI - distinct from the base
+      // station's downlink RSSI, which comes from the RADIO_PACKET envelope.
+      // StatusMsg2_t took this over from StatusMsg0_t's uint8 field.
+      telemetry.rssi = decodedMessage.rssi;
       break;
     case RADIO_MESSAGE_TYPES.STATUS3:
       telemetry.qR = decodedMessage.qR;

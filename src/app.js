@@ -8,8 +8,10 @@ import {
   PACKET_SCHEMAS,
   CONFIG_KEYS,
   CONFIG_OPS,
+  CONFIG_READ_ENTRY_MAX,
   CONFIG_RESULTS,
   CONFIG_RESULT_LABELS,
+  CONFIG_VERSION,
   getConfigKeyById,
   getSchemaById,
   getOutboundSchemas,
@@ -61,7 +63,7 @@ const state = {
   // running), which can emit an unsolicited type-5 reply after a plain
   // COMMAND send. Only treat an inbound CONFIG response as real if a direct
   // (non-relay) config request is actually outstanding.
-  pendingDirectConfigRequest: false,
+  pendingDirectConfigResponses: 0,
   // Guards against overlapping Read/Apply/Reset sequences (e.g. the
   // auto-config-read racing a manual click) - relay mode's sequential
   // per-key requests share one single-slot resolver, so two concurrent
@@ -1303,6 +1305,17 @@ function setConfigStatus(id, text, tone = '') {
   pill.className = `config-status ${tone}`;
 }
 
+// UNKNOWN_VERSION means the firmware threw the request away on its version
+// byte alone, before looking at any key. Both the USB and radio handlers stamp
+// their own CONFIG_VERSION onto that rejection, so name both numbers: the bare
+// label gives no hint that the fix is reflashing one side or the other.
+function formatConfigResult(result, reportedVersion) {
+  const label = CONFIG_RESULT_LABELS[result] ?? `Unknown (${result})`;
+  if (result !== CONFIG_RESULTS.UNKNOWN_VERSION) return label;
+  const reported = Number.isInteger(reportedVersion) ? `v${reportedVersion}` : 'nothing usable';
+  return `${label} (sent v${CONFIG_VERSION}, firmware reports ${reported})`;
+}
+
 function configEntryValue(entry) {
   const input = configInput(entry.id);
   return entry.kind === 'bool' ? (input.checked ? 1 : 0) : Number(input.value);
@@ -1347,7 +1360,7 @@ function applyRadioConfigReply(operation, key, reply) {
 
   const result = reply.state;
   const tone = result === CONFIG_RESULTS.OK ? 'ok' : 'error';
-  setConfigStatus(entry.id, CONFIG_RESULT_LABELS[result] ?? `Unknown (${result})`, tone);
+  setConfigStatus(entry.id, formatConfigResult(result, reply.version), tone);
 
   if (operation === CONFIG_OPS.READ && result === CONFIG_RESULTS.OK) {
     const currentCell = configCurrentCell(entry.id);
@@ -1379,10 +1392,21 @@ async function sendConfigRead() {
       return;
     }
 
-    const values = { operation: CONFIG_OPS.READ, entries: CONFIG_KEYS.map((entry) => ({ key: entry.id })) };
-    const payload = encodePayload(configSchema, values);
-    state.pendingDirectConfigRequest = true;
-    await sendFrame(configSchema.id, payload, values, 'Config Read');
+    // usb_config_read_response carries at most CONFIG_READ_ENTRY_MAX entries
+    // (4 + 8 * 7 fills the 60-byte payload), so a full read of the V2 key set
+    // does not fit in one request. Send it as chunks; updateConfigFromResponse
+    // matches each reply's statuses by key, so the replies need no ordering.
+    const chunks = [];
+    for (let index = 0; index < CONFIG_KEYS.length; index += CONFIG_READ_ENTRY_MAX) {
+      chunks.push(CONFIG_KEYS.slice(index, index + CONFIG_READ_ENTRY_MAX));
+    }
+
+    state.pendingDirectConfigResponses = chunks.length;
+    for (const chunk of chunks) {
+      const values = { operation: CONFIG_OPS.READ, entries: chunk.map((entry) => ({ key: entry.id })) };
+      const payload = encodePayload(configSchema, values);
+      await sendFrame(configSchema.id, payload, values, 'Config Read');
+    }
   } catch (error) {
     showToast(error.message, 'error');
   } finally {
@@ -1429,7 +1453,7 @@ async function sendConfigApply() {
       entries: CONFIG_KEYS.map((entry) => ({ key: entry.id, value: configEntryValue(entry) })),
     };
     const payload = encodePayload(configSchema, values);
-    state.pendingDirectConfigRequest = true;
+    state.pendingDirectConfigResponses = 1;
     await sendFrame(configSchema.id, payload, values, 'Config Set');
   } catch (error) {
     showToast(error.message, 'error');
@@ -1460,7 +1484,7 @@ async function sendConfigZeroAll() {
 
     const values = { operation: CONFIG_OPS.ZERO_ALL, entries: [] };
     const payload = encodePayload(configSchema, values);
-    state.pendingDirectConfigRequest = true;
+    state.pendingDirectConfigResponses = 1;
     await sendFrame(configSchema.id, payload, values, 'Config Zero All');
   } catch (error) {
     showToast(error.message, 'error');
@@ -1474,9 +1498,9 @@ function updateConfigFromResponse(decoded) {
   // on old builds, emitting a spurious type-5 reply after a plain command -
   // and that spurious reply's operation tag is indistinguishable from a real
   // one. Only act on it if we actually asked for a direct config response.
-  if (!state.pendingDirectConfigRequest) return;
+  if (state.pendingDirectConfigResponses <= 0) return;
   if (decoded.operation !== CONFIG_OPS.READ_RESPONSE && decoded.operation !== CONFIG_OPS.SET_RESPONSE) return;
-  state.pendingDirectConfigRequest = false;
+  state.pendingDirectConfigResponses -= 1;
 
   state.configSyncedAt = performance.now();
   setText('config-sync-status', `Synced ${new Date().toLocaleTimeString()}`);
@@ -1486,7 +1510,7 @@ function updateConfigFromResponse(decoded) {
     if (!entry) continue;
 
     const tone = status.result === CONFIG_RESULTS.OK ? 'ok' : 'error';
-    setConfigStatus(entry.id, CONFIG_RESULT_LABELS[status.result] ?? `Unknown (${status.result})`, tone);
+    setConfigStatus(entry.id, formatConfigResult(status.result, decoded.version), tone);
 
     if (decoded.operation === CONFIG_OPS.READ_RESPONSE && status.value !== undefined) {
       const currentCell = configCurrentCell(entry.id);
@@ -1502,7 +1526,7 @@ function updateConfigFromResponse(decoded) {
   }
 
   if (decoded.result !== CONFIG_RESULTS.OK) {
-    showToast(`Config request rejected: ${CONFIG_RESULT_LABELS[decoded.result] ?? decoded.result}`, 'error');
+    showToast(`Config request rejected: ${formatConfigResult(decoded.result, decoded.version)}`, 'error');
   }
 }
 

@@ -19,6 +19,7 @@ import {
   CRC_SIZE,
   CONFIG_OPS,
   CONFIG_RESULTS,
+  CONFIG_VERSION,
   getSchemaById,
   getOutboundSchemas,
   encodePayload,
@@ -223,7 +224,7 @@ const setRequestPayload = encodePayload(configSchema, {
 });
 assert.deepEqual(
   Array.from(setRequestPayload),
-  [PROTOCOL_VERSION, CONFIG_OPS.SET, 2, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x06, 0x00, 0xfb, 0xff, 0xff, 0xff],
+  [CONFIG_VERSION, CONFIG_OPS.SET, 2, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x06, 0x00, 0xfb, 0xff, 0xff, 0xff],
 );
 
 // READ request entries are still 6 bytes each (key + value), matching SET's
@@ -234,11 +235,11 @@ const readRequestPayload = encodePayload(configSchema, {
 });
 assert.deepEqual(
   Array.from(readRequestPayload),
-  [PROTOCOL_VERSION, CONFIG_OPS.READ, 2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
+  [CONFIG_VERSION, CONFIG_OPS.READ, 2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
 );
 
 const zeroAllPayload = encodePayload(configSchema, { operation: CONFIG_OPS.ZERO_ALL, entries: [] });
-assert.deepEqual(Array.from(zeroAllPayload), [PROTOCOL_VERSION, CONFIG_OPS.ZERO_ALL, 0]);
+assert.deepEqual(Array.from(zeroAllPayload), [CONFIG_VERSION, CONFIG_OPS.ZERO_ALL, 0]);
 
 assert.throws(
   () => encodePayload(configSchema, {
@@ -256,7 +257,7 @@ assert.throws(
 );
 
 const setResponsePayload = new Uint8Array([
-  PROTOCOL_VERSION, CONFIG_OPS.SET_RESPONSE, 2, CONFIG_RESULTS.OK,
+  CONFIG_VERSION, CONFIG_OPS.SET_RESPONSE, 2, CONFIG_RESULTS.OK,
   0x00, 0x00, CONFIG_RESULTS.OK,
   0x06, 0x00, CONFIG_RESULTS.INVALID_VALUE,
 ]);
@@ -268,7 +269,7 @@ assert.deepEqual(decodedSetResponse.statuses[0], { key: 0, result: CONFIG_RESULT
 assert.deepEqual(decodedSetResponse.statuses[1], { key: 6, result: CONFIG_RESULTS.INVALID_VALUE });
 
 const readResponsePayload = new Uint8Array([
-  PROTOCOL_VERSION, CONFIG_OPS.READ_RESPONSE, 2, CONFIG_RESULTS.OK,
+  CONFIG_VERSION, CONFIG_OPS.READ_RESPONSE, 2, CONFIG_RESULTS.OK,
   0x00, 0x00, CONFIG_RESULTS.OK, 0x14, 0x00, 0x00, 0x00,
   0x04, 0x00, CONFIG_RESULTS.OK, 0x5a, 0x00, 0x00, 0x00,
 ]);
@@ -290,32 +291,39 @@ assert.deepEqual(Array.from(configPackets[0].payload), Array.from(setRequestPayl
 
 // --- RF-level message codecs (STATUS0-6, radio CONFIG, COMMAND reuse) ---
 
+// STATUS0 carries no RSSI: the drone's StatusMsg0_t pads out its last byte and
+// reports link strength from StatusMsg2_t instead.
 const status0Bytes = encodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, {
-  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, rssi: 80, currentMode: 4,
+  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4, reserved: 0,
 });
-assert.deepEqual(Array.from(status0Bytes), [0xe8, 0x03, 0xd0, 0x07, 0xf4, 0x01, 0x50, 0x04]);
-assert.deepEqual(decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Bytes), {
-  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, rssi: 80, currentMode: 4,
-});
+assert.deepEqual(Array.from(status0Bytes), [0xe8, 0x03, 0xd0, 0x07, 0xf4, 0x01, 0x04, 0x00]);
+const decodedStatus0 = decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Bytes);
+assert.equal(decodedStatus0.loopTimeAvg, 1000);
+assert.equal(decodedStatus0.loopTimeMax, 2000);
+assert.equal(decodedStatus0.runTime, 500);
+assert.equal(decodedStatus0.currentMode, 4);
+assert.equal(decodedStatus0.rssi, undefined);
 
 // STATUS2's motor fields are 2 bytes each on the wire (matching the drone's
 // real StatusMsg2_t) - values above 255 prove this isn't truncated to a byte
-// the way the base station's current (buggy) mirror struct would.
+// the way the base station's current (buggy) mirror struct would. Its final
+// field is the uint16 RSSI that StatusMsg0_t used to carry as a uint8.
 const status2Bytes = encodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS2, {
-  motor1Set: 513, motor2Set: 7, voltage: 16800, reserved: 0,
+  motor1Set: 513, motor2Set: 7, voltage: 16800, rssi: 80,
 });
-assert.deepEqual(Array.from(status2Bytes), [0x01, 0x02, 0x07, 0x00, 0xa0, 0x41, 0x00, 0x00]);
+assert.deepEqual(Array.from(status2Bytes), [0x01, 0x02, 0x07, 0x00, 0xa0, 0x41, 0x50, 0x00]);
 const decodedStatus2 = decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS2, status2Bytes);
 assert.equal(decodedStatus2.motor1Set, 513);
 assert.equal(decodedStatus2.motor2Set, 7);
 assert.equal(decodedStatus2.voltage, 16800);
+assert.equal(decodedStatus2.rssi, 80);
 
 const radioConfigBytes = encodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, {
-  version: PROTOCOL_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
+  version: CONFIG_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
 });
-assert.deepEqual(Array.from(radioConfigBytes), [0x01, 0x01, 0x04, 0x00, 0x5a, 0x00, 0x00, 0x00]);
+assert.deepEqual(Array.from(radioConfigBytes), [0x02, 0x01, 0x04, 0x00, 0x5a, 0x00, 0x00, 0x00]);
 assert.deepEqual(decodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, radioConfigBytes), {
-  version: PROTOCOL_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
+  version: CONFIG_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
 });
 
 assert.deepEqual(
@@ -397,11 +405,12 @@ assert.deepEqual(Array.from(radioPacketFramePackets[0].payload), Array.from(rece
 const relayTelemetry = {};
 applyRadioStatusToTelemetry(relayTelemetry, RADIO_MESSAGE_TYPES.STATUS0,
   decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Bytes));
-assert.deepEqual(relayTelemetry, { loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4, rssi: 80 });
+assert.deepEqual(relayTelemetry, { loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4 });
 
 applyRadioStatusToTelemetry(relayTelemetry, RADIO_MESSAGE_TYPES.STATUS2, decodedStatus2);
 assert.equal(relayTelemetry.motor1Set, 513);
 assert.equal(relayTelemetry.motor2Set, 7);
+assert.equal(relayTelemetry.rssi, 80);
 // A STATUS2 update must not disturb fields owned by the earlier STATUS0 update.
 assert.equal(relayTelemetry.loopTimeAvg, 1000);
 assert.equal(relayTelemetry.currentMode, 4);
@@ -421,7 +430,7 @@ const fakeRequestOneAndWait = async (operation, key, value) => {
   sequencedKeys.push({ operation, key, value });
   await new Promise((resolve) => { setTimeout(resolve, 2); });
   requestInFlight = false;
-  return key === 2 ? null : { version: PROTOCOL_VERSION, state: CONFIG_RESULTS.OK, configKey: key, value: value + 1 };
+  return key === 2 ? null : { version: CONFIG_VERSION, state: CONFIG_RESULTS.OK, configKey: key, value: value + 1 };
 };
 
 const sequenceResults = [];

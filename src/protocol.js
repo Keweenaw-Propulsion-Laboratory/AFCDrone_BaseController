@@ -98,6 +98,13 @@ export function formatDroneState(value) {
   return DRONE_STATE_NAMES[value] ?? `Unknown (${value})`;
 }
 
+// The persistent-config wire version, versioned independently of the USB
+// framing PROTOCOL_VERSION. This is AFC-Drone's CONFIG_VERSION (src/configs.cpp)
+// and both the USB and radio firmware handlers reject any config request whose
+// version byte does not match theirs with ConfigResult::UNKNOWN_VERSION. V2
+// added DebugMode at key 0 and moved TxPowerDbm after the booleans.
+export const CONFIG_VERSION = 2;
+
 export const CONFIG_OPS = Object.freeze({
   READ: 0x01,
   SET: 0x02,
@@ -144,7 +151,7 @@ export function getConfigKeyById(id) {
 }
 
 function encodeConfigPayload(values = {}) {
-  const { operation, entries = [], version = PROTOCOL_VERSION } = values;
+  const { operation, entries = [], version = CONFIG_VERSION } = values;
 
   let maxEntries;
   if (operation === CONFIG_OPS.SET) maxEntries = CONFIG_SET_ENTRY_MAX;
