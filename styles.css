@@ -95,6 +95,57 @@ h3 { margin-top: 18px; font-size: .9rem; color: var(--muted); }
 .link-mode-badge.relay { color: var(--success); border-color: rgba(70, 213, 154, .35); }
 .link-mode-badge.unknown { color: var(--warning); border-color: rgba(255, 190, 85, .4); }
 
+.topbar { flex-wrap: wrap; }
+.vehicle-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-basis: 100%;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.vehicle-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: .82rem;
+  transition: opacity .2s ease;
+}
+.vehicle-chip-label, .vehicle-chip-detail { color: var(--muted); }
+.vehicle-chip strong { font-family: "SFMono-Regular", Consolas, monospace; font-size: .95rem; }
+.vehicle-chip[data-tone="ok"] strong { color: var(--success); }
+.vehicle-chip[data-tone="active"] { border-color: rgba(66, 184, 255, .35); }
+.vehicle-chip[data-tone="active"] strong { color: var(--accent); }
+.vehicle-chip[data-tone="warning"] { border-color: rgba(255, 190, 85, .4); }
+.vehicle-chip[data-tone="warning"] strong { color: var(--warning); }
+.vehicle-chip[data-tone="danger"] { border-color: rgba(255, 101, 119, .48); }
+.vehicle-chip[data-tone="danger"] strong { color: var(--danger); }
+.vehicle-chip.stale { opacity: .5; }
+
+/* The flight-mode chip holds the selector itself, so the reported state and
+   the request are one control rather than two that can disagree. */
+.mode-chip { align-items: center; }
+.mode-chip select {
+  min-width: 150px;
+  padding: 3px 8px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: .95rem;
+}
+.mode-chip[data-tone="ok"] select { color: var(--success); }
+.mode-chip[data-tone="active"] select { color: var(--accent); }
+.mode-chip[data-tone="warning"] select { color: var(--warning); }
+.mode-chip[data-tone="danger"] select { color: var(--danger); }
+/* While a request is outstanding the selector is showing what was asked for,
+   not what the drone reports - make that visually obvious. */
+.mode-chip.pending { border-color: rgba(66, 184, 255, .55); }
+.mode-chip.pending select { color: var(--accent); border-color: rgba(66, 184, 255, .55); }
+.mode-chip.pending .vehicle-chip-detail { color: var(--accent); }
+
 button {
   border: 1px solid transparent;
   border-radius: 10px;
@@ -153,6 +204,12 @@ button.full-width { width: 100%; margin-top: 16px; }
 .legend-dot.warning { background: var(--warning); }
 .stats-inline { display: flex; gap: 14px; flex-wrap: wrap; }
 .stats-inline strong { color: var(--text); }
+/* The comm watchdog sits with the other telemetry-panel stats; its tone is
+   the only thing that distinguishes a tripped vehicle at a glance. */
+.stats-inline [data-tone="ok"] strong { color: var(--success); }
+.stats-inline [data-tone="warning"] strong { color: var(--warning); }
+.stats-inline [data-tone="danger"] strong { color: var(--danger); }
+#telemetry-watchdog { cursor: help; }
 .chart-heading { align-items: center; }
 .chart-heading-controls {
   display: flex;
@@ -463,6 +520,11 @@ button.full-width { width: 100%; margin-top: 16px; }
 .telemetry-map .leaflet-bar a:hover { background: var(--surface-3); color: var(--text); }
 .drone-position-marker { filter: drop-shadow(0 0 5px rgba(66, 184, 255, .75)); }
 
+/* Battery and flight mode must stay in view while scrolling. On narrow
+   screens the header stacks too tall to pin, so it scrolls normally there. */
+@media (min-width: 821px) {
+  .topbar { position: sticky; top: 0; z-index: 10; background: var(--surface); }
+}
 @media (max-width: 1180px) {
   .metric-grid { grid-template-columns: repeat(4, minmax(145px, 1fr)); }
   .command-layout { grid-template-columns: 1fr; }
@@ -487,6 +549,7 @@ button.full-width { width: 100%; margin-top: 16px; }
   .range-pair { grid-template-columns: 1fr 84px; }
   .connection-controls > * { flex: 1 1 auto; }
   .connection-badge { flex-basis: 100%; }
+  .vehicle-status > * { flex: 1 1 auto; }
   .terminal-line { grid-template-columns: 72px 28px minmax(0,1fr); gap: 6px; }
   .telemetry-map { height: 300px; }
 }

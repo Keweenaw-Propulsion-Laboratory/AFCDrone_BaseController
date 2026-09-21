@@ -19,6 +19,11 @@ export function encodeRadioCommandEnvelope(commandValues) {
   return encodeRadioPacketEnvelope(RADIO_MESSAGE_TYPES.COMMAND, message);
 }
 
+export function encodeRadioHeartbeatEnvelope(heartbeatValues) {
+  const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.HEARTBEAT, heartbeatValues);
+  return encodeRadioPacketEnvelope(RADIO_MESSAGE_TYPES.HEARTBEAT, message);
+}
+
 export function encodeRadioConfigEnvelope(operation, key, value = 0) {
   const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, {
     version: CONFIG_VERSION,
@@ -42,6 +47,10 @@ export function applyRadioStatusToTelemetry(telemetry, radioMessageType, decoded
       telemetry.loopTimeMax = decodedMessage.loopTimeMax;
       telemetry.runTime = decodedMessage.runTime;
       telemetry.currentMode = decodedMessage.currentMode;
+      // STATUS0's byte 7 used to be a zero pad and now carries the watchdog
+      // flags, so relay mode surfaces the same FED/TRIPPED state that direct
+      // mode reads from TELEMETRY offset 54.
+      telemetry.watchDog = decodedMessage.watchDog;
       break;
     case RADIO_MESSAGE_TYPES.STATUS1:
       telemetry.gimbalPitch = decodedMessage.gimbalPitch;

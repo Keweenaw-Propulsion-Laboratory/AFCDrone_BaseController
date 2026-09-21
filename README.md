@@ -143,6 +143,23 @@ python server.py
 
 ## Dashboard
 
+### Header: battery and flight mode
+
+The header shows battery voltage and flight mode on every tab. On screens wider than 820 px it also stays pinned to the top of the page while you scroll.
+
+- **Battery** shows the telemetry `voltage` in volts and as a percentage. The percentage is linear across 13.09–16.5 V (4S LiPo). It turns amber at or below 40% and red at or below 20%. A reading of `0` means the drone is not reporting voltage yet, and the header shows `--`.
+- **Flight mode** is one control rather than two. The selector shows the drone's reported `Drone::States` and follows it whenever the drone changes state on its own. Requesting a mode switches the selector to the requested state and highlights it until telemetry confirms the change, so the request and the reported state can never silently disagree. Requesting either flight state asks for confirmation first. States the ground cannot request — `BOOT`, the setup states and `FAULT_ERROR` — appear as a disabled `(reported)` entry so the drone's real state is always visible.
+
+Both chips dim when no telemetry has arrived for 2 seconds.
+
+#### Releasing to Safe
+
+The firmware acts on the heartbeat's requested state only when it **changes**, so the dashboard never leaves a stale flight request asserted:
+
+- Disconnecting, stopping demo mode, or 2 seconds without telemetry releases the request to Safe, with a toast and a terminal line.
+- Whenever the drone reports a state it reached on its own — a watchdog trip, a fault, its boot sequence — the selector follows it and the request is released to Safe.
+- An armed state is never adopted automatically. Taking control again is always an explicit request, which is what produces the `SAFE` → flight edge the firmware honors and what clears a latched `TRIPPED`.
+
 ### Live telemetry
 
 The front page displays the latest decoded telemetry, including:
@@ -159,6 +176,9 @@ The front page displays the latest decoded telemetry, including:
 - velocity
 - position
 - latitude and longitude
+- comm watchdog
+
+The **Comm watchdog** stat in the Latest telemetry panel heading shows the drone's `watchDog` flags: *Fed* (green) when a heartbeat arrived within the last 100 ms, *Starved* (amber) when one has not, and *Tripped* (red) when the watchdog expired while movement was allowed. Hover it for the full explanation. *Tripped* is latched by the firmware and clears only once the dashboard has released its request back to Safe, so the event survives the outage that caused it; the dashboard raises a toast and a terminal line on the latch, not on the mode transition.
 
 ### Telemetry graphs
 
@@ -203,10 +223,10 @@ The command panel sends type `4` command packets containing:
 
 - target slot
 - active slot
-- gimbal X
-- gimbal Y
-- motor 0 speed
-- motor 1 speed
+- gimbal pitch
+- gimbal yaw
+- top motor speed
+- bottom motor speed
 
 Nonzero motor output is blocked until the motor-output interlock is enabled. The **Stop Motors** action immediately sets both motor commands to zero and transmits a command frame.
 
@@ -263,13 +283,19 @@ Total frame size:
 
 | Value | Name | Direction | Payload |
 |---:|---|---|---|
-| 0 | `RAW` | Both | Variable, 0–60 bytes |
-| 1 | `DEBUG_TEXT` | Drone to dashboard | Variable, 0–60 bytes |
-| 2 | `RADIO_PACKET` | Drone to dashboard | Variable, 0–60 bytes |
-| 3 | `TELEMETRY` | Drone to dashboard | Exactly 54 bytes |
+| 0 | `RAW` | Both | Variable, 0–64 bytes |
+| 1 | `DEBUG_TEXT` | Drone to dashboard | Variable, 0–64 bytes |
+| 2 | `RADIO_PACKET` | Drone to dashboard | Variable, 0–64 bytes |
+| 3 | `TELEMETRY` | Drone to dashboard | Exactly 64 bytes |
 | 4 | `COMMAND` | Dashboard to drone | Exactly 8 bytes |
+| 5 | `CONFIG` | Both | Variable, 3–60 bytes |
+| 10 | `HEARTBEAT` | Dashboard to drone | Exactly 8 bytes, every 25 ms |
 
 All multibyte fields are little-endian.
+
+The USB payload ceiling is **64 bytes**, so a maximum frame is **73 bytes** (9 framing + 64 payload). `CONFIG` deliberately did not grow with it: both requests and read responses stay at 60 bytes.
+
+A relay that forwards these frames over a UART needs `SERIAL_TX_BUFFER_SIZE >= 74`. `availableForWrite()` can never exceed `SERIAL_TX_BUFFER_SIZE - 1`, so a frame larger than the buffer is never written, never popped, and permanently blocks everything queued behind it. A buffer sized for the old 69-byte maximum will wedge. The drone is set to 256.
 
 ### CRC
 
@@ -311,10 +337,10 @@ Command packets use type `4` and an eight-byte payload.
 | Payload offset | Size | Field | Encoding |
 |---:|---:|---|---|
 | 0 | 1 | `flags` | bitfield |
-| 1 | 2 | `gimbalX` | int16 LE |
-| 3 | 2 | `gimbalY` | int16 LE |
-| 5 | 1 | `motor0Speed` | uint8 |
-| 6 | 1 | `motor1Speed` | uint8 |
+| 1 | 2 | `gimbalPitch` | int16 LE |
+| 3 | 2 | `gimbalYaw` | int16 LE |
+| 5 | 1 | `motorTopSpeed` | uint8 |
+| 6 | 1 | `motorBottomSpeed` | uint8 |
 | 7 | 1 | unused | always `0` |
 
 Flag bits:
@@ -338,9 +364,58 @@ CRC is valid
 
 The firmware does not currently emit a USB acknowledgement.
 
+## Heartbeat payload
+
+While a serial link is up and its direct/relay mode is known, the dashboard sends a heartbeat every 25 ms. It is type `10` on both links: a bare USB frame in direct mode, and an RFM69 message inside a `RADIO_PACKET` in relay mode, with the same 8 bytes either way.
+
+| Payload offset | Size | Field | Encoding |
+|---:|---:|---|---|
+| 0 | 1 | `requestedState` | uint8 `Drone::States` to request |
+| 1 | 7 | reserved | always `0` |
+
+**Only `HEARTBEAT` feeds the link watchdog**, and the watchdog expires 100 ms after the last one. `COMMAND` traffic does not feed it, so streaming commands without heartbeats gets the vehicle disarmed. The watchdog is only evaluated at or above `READY_ARMED`. On expiry the actuators fail closed within one 1 kHz tick, the drone drops to `SAFE`, `TRIPPED` latches, and a one-shot `DEBUG_TEXT` reads `DRONE: COMM WATCHDOG EXPIRED -> SAFE`.
+
+### Requested state is edge triggered
+
+The firmware acts on `requestedState` only when it **changes**. A repeat of the last requested state is a keepalive and nothing else, which is what feeds the watchdog.
+
+This is why there is no "no request" value. A heartbeat sent before a dropout is byte-identical to one sent after it, so honoring repeats would let a reconnecting client silently re-arm the vehicle the moment the link returned. The dashboard therefore always asserts something, and what it asserts when it wants nothing is `SAFE`.
+
+The consequences for any client:
+
+- On link loss, set the requested state to `SAFE` and keep sending heartbeats requesting `SAFE` while down or reconnecting.
+- To resume, request the flight state again. That `SAFE` → flight edge is what the firmware honors, and it clears `TRIPPED`.
+- A client that keeps asserting its pre-dropout flight state stays in `SAFE` indefinitely with **no error response**, because the request is not a change.
+
+An escalation out of `SAFE` is also refused until the vehicle has been in `SAFE` for 500 ms. The refusal does not consume the request: holding the new state gets it honored on the first heartbeat after the dwell passes, which is what the dashboard does.
+
+To keep the packet monitor readable, it logs only the first heartbeat after connecting and each heartbeat whose `requestedState` has changed.
+
+Browsers throttle timers in background tabs, so heartbeats can slow down or stop when the dashboard tab is not in the foreground — which, now that the watchdog is enforced, will disarm a flying vehicle.
+
+### `Drone::States`
+
+The same enum is reported as telemetry `currentMode` / RF `STATUS0` `currentMode` and requested in heartbeat byte 0. The values are deliberately non-contiguous: `0`–`4` are the boot sequence, `10`–`12` are the live states.
+
+| Value | Name | Meaning | Requestable |
+|---:|---|---|---|
+| 0 | `BOOT` | Firmware start-up | No |
+| 1 | `RADIO_SETUP` | Bringing up the radio | No |
+| 2 | `SENSOR_SETUP` | Bringing up the sensors | No |
+| 3 | `CONTROL_SETUP` | Bringing up flight control | No |
+| 4 | `SAFE` | No movement allowed but all systems go | Yes |
+| 10 | `READY_ARMED` | Gimbal movement allowed | Yes |
+| 11 | `MAN_FLIGHT` | Manual motors and gimbal | Yes |
+| 12 | `AUTO_FLIGHT` | Flight-control driven motors and gimbal | Yes |
+| 255 | `FAULT_ERROR` | Unrecoverable error has occurred | No |
+
+The dashboard treats `MAN_FLIGHT` and `AUTO_FLIGHT` as "flying": both ask for confirmation before being requested, and both suppress the automatic config read on connect.
+
 ## Telemetry payload
 
-Telemetry packets use type `3` and a 54-byte payload. A complete telemetry frame is 63 bytes and is normally emitted about every 100 ms.
+Telemetry packets use type `3` and a 64-byte payload. A complete telemetry frame is 73 bytes and is normally emitted about every 100 ms.
+
+The record grew from 54 to 64 bytes at the tail. Every pre-existing field kept its offset, so a decoder that reads by offset keeps working; one that asserts a 54-byte payload length rejects every frame.
 
 | Offset | Size | Field | Encoding / unit |
 |---:|---:|---|---|
@@ -355,7 +430,7 @@ Telemetry packets use type `3` and a 54-byte payload. A complete telemetry frame
 | 14 | 2 | `bottomServoSet` | int16 LE |
 | 16 | 1 | `motor1Set` | uint8 |
 | 17 | 1 | `motor2Set` | uint8 |
-| 18 | 2 | `voltage` | uint16 LE |
+| 18 | 2 | `voltage` | uint16 LE, battery millivolts; `0` = not reported |
 | 20 | 2 | `qR` | int16 LE |
 | 22 | 2 | `qI` | int16 LE |
 | 24 | 2 | `qJ` | int16 LE |
@@ -371,8 +446,22 @@ Telemetry packets use type `3` and a 54-byte payload. A complete telemetry frame
 | 44 | 2 | `posZ` | int16 LE |
 | 46 | 4 | `latitude` | IEEE-754 float32 LE |
 | 50 | 4 | `longitude` | IEEE-754 float32 LE |
+| 54 | 1 | `watchDog` | uint8 flag bits, see below |
+| 55 | 9 | reserved | always `0` |
 
 `runTime` wraps after 65,536 seconds, or approximately 18.2 hours.
+
+### `watchDog` flags
+
+The same byte and encoding appear at telemetry offset 54 and at offset 7 of the 8-byte RF `STATUS0` frame, which previously transmitted it as a zero pad. There is no radio wire-size change.
+
+| Bit | Name | Meaning |
+|---:|---|---|
+| 0 | `FED` | A heartbeat arrived within the last 100 ms. Live and self-clearing. |
+| 1 | `TRIPPED` | The watchdog expired while movement was allowed. **Latched** — cleared only when the client releases its requested state to `SAFE`. |
+| 2–7 | — | Reserved, zero. |
+
+Alert on `TRIPPED` rather than on the state transition. It is latched precisely so the event survives the outage that caused it: over the radio nothing arrives while the link is down, so the `currentMode` change and the drone's `DEBUG_TEXT` are already in the past by the time packets resume.
 
 ## Adding packet types
 
@@ -415,7 +504,7 @@ When adding a packet type:
 2. Add its schema to `PACKET_SCHEMAS`.
 3. Add custom UI handling if needed.
 4. Add encode/decode tests to `tests/protocol.test.mjs`.
-5. Keep the payload at or below 60 bytes.
+5. Keep the payload at or below 64 bytes (60 for `CONFIG`).
 
 ## Project structure
 

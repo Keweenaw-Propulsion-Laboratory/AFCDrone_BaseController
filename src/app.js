@@ -9,6 +9,7 @@ import {
   CONFIG_KEYS,
   CONFIG_OPS,
   CONFIG_READ_ENTRY_MAX,
+  CONFIG_SET_ENTRY_MAX,
   CONFIG_RESULTS,
   CONFIG_RESULT_LABELS,
   CONFIG_VERSION,
@@ -22,11 +23,23 @@ import {
   hexToBytes,
   formatFieldValue,
   DRONE_STATES,
+  isFlightState,
   formatDroneState,
+  REQUESTABLE_DRONE_STATES,
+  ARMED_DRONE_STATES,
+  isRequestableState,
+  HEARTBEAT_INTERVAL_MS,
+  WATCHDOG_TIMEOUT_MS,
+  ESCALATION_DWELL_MS,
+  BATTERY_LOW_PERCENT,
+  BATTERY_CRITICAL_PERCENT,
+  batteryPercent,
+  formatVoltage,
 } from './protocol.js';
 import { SerialLink } from './serial-link.js';
 import {
   encodeRadioCommandEnvelope,
+  encodeRadioHeartbeatEnvelope,
   encodeRadioConfigEnvelope,
   applyRadioStatusToTelemetry,
   sendRadioConfigSequence,
@@ -80,6 +93,32 @@ const state = {
   relayTelemetry: {},
   pendingIdentifyResolve: null,
   pendingRadioConfigResolve: null,
+  // The Drone::States asserted in every heartbeat. The firmware acts on this
+  // byte only when it CHANGES, so it is never null: SAFE is what we assert
+  // when we are not asking for anything. Released to SAFE on disconnect and
+  // on link loss, so a reconnect can never silently re-arm the vehicle.
+  requestedDroneState: DRONE_STATES.SAFE,
+  // Non-null while the user has asked for a state the drone has not reported
+  // back yet. The mode selector shows this instead of telemetry until the
+  // drone confirms (or overrules) the change.
+  pendingModeRequest: null,
+  pendingModeRequestAt: null,
+  // The last currentMode telemetry reported, kept separately from
+  // lastTelemetry so drone-side changes can be detected as edges.
+  lastReportedMode: null,
+  // Last seen watchDog.tripped, so the alert fires on the latch rather than
+  // on every packet that repeats it.
+  lastWatchdogTripped: false,
+  // Set once telemetry has gone stale and the request has been released to
+  // SAFE, so the release happens once per outage rather than every tick.
+  linkLossReleased: false,
+  // Demo-only: the state the simulated vehicle is actually in.
+  demoMode: DRONE_STATES.BOOT,
+  demoBootDone: false,
+  demoStartedAt: 0,
+  // The request carried by the last heartbeat logged to the packet monitor;
+  // undefined forces the next heartbeat to be logged.
+  lastLoggedHeartbeatRequest: undefined,
   history: {
     loopTimeAvg: [],
     loopTimeMax: [],
@@ -90,6 +129,16 @@ const state = {
 const telemetrySchema = getSchemaById(USB_MESSAGE_TYPES.TELEMETRY);
 const commandSchema = getSchemaById(USB_MESSAGE_TYPES.COMMAND);
 const configSchema = getSchemaById(USB_MESSAGE_TYPES.CONFIG);
+const heartbeatSchema = getSchemaById(USB_MESSAGE_TYPES.HEARTBEAT);
+
+const TELEMETRY_STALE_MS = 2000;
+// How long an unacknowledged request waits before the chip says so rather
+// than just "requesting". Comfortably past the firmware's escalation dwell,
+// so a request that is merely waiting out the dwell doesn't look stuck.
+const MODE_REQUEST_SLOW_MS = ESCALATION_DWELL_MS * 4;
+// Demo-only: how long the simulated drone takes to honor a request, so the
+// selector's pending state is visible without hardware.
+const DEMO_MODE_ACK_DELAY_MS = 900;
 
 const CHART_RETENTION_MS = 30 * 60 * 1000;
 const CHART_MAX_POINTS_PER_PIXEL = 2;
@@ -157,6 +206,7 @@ function setConnectionStatus(connected, label = null) {
   } else {
     setText('metric-connection-detail', 'Server ready; no serial port open');
   }
+  updateModeRequestControl();
 }
 
 function updateLinkModeDisplay() {
@@ -186,7 +236,20 @@ function resetLinkMode() {
   state.pendingRadioConfigResolve = null;
   state.relayTelemetry = {};
   state.autoConfigReadDone = false;
+  // Release to SAFE rather than to "no request": the firmware only acts on a
+  // change, so the SAFE -> flight edge a reconnecting operator needs cannot
+  // exist unless the dashboard goes back to SAFE first.
+  state.requestedDroneState = DRONE_STATES.SAFE;
+  state.pendingModeRequest = null;
+  state.pendingModeRequestAt = null;
+  state.lastReportedMode = null;
+  state.lastWatchdogTripped = false;
+  state.linkLossReleased = false;
+  state.lastLoggedHeartbeatRequest = undefined;
   updateLinkModeDisplay();
+  updateModeRequestControl();
+  renderModeStatus();
+  updateWatchdogStatus(null);
 }
 
 // A relay connection can be saturated with STATUS0-6 telemetry (one every
@@ -221,6 +284,7 @@ async function runIdentifyHandshake() {
   const generation = ++identifyGeneration;
   state.linkMode = null;
   state.linkModeKnown = false;
+  state.lastLoggedHeartbeatRequest = undefined;
   updateLinkModeDisplay();
 
   let kind = null;
@@ -794,14 +858,14 @@ function updateTelemetryMap(decoded) {
 }
 
 // Fires once per connection, as soon as the first telemetry sample tells us
-// whether the vehicle is in FLIGHT - configuration reads (and especially
-// writes) shouldn't happen while it's flying.
+// whether the vehicle is flying - configuration reads (and especially writes)
+// shouldn't happen in either flight state.
 function maybeAutoReadConfig(currentMode) {
   if (state.autoConfigReadDone || currentMode === undefined || currentMode === null) return;
   state.autoConfigReadDone = true;
 
-  if (currentMode === DRONE_STATES.FLIGHT) {
-    showToast('Skipped automatic config read: vehicle is in FLIGHT', 'warning');
+  if (isFlightState(currentMode)) {
+    showToast(`Skipped automatic config read: vehicle is in ${formatDroneState(currentMode)}`, 'warning');
     return;
   }
 
@@ -839,13 +903,18 @@ function updateTelemetry(decoded) {
   const chartTimestamp = Date.now();
 
   maybeAutoReadConfig(decoded.currentMode);
+  applyReportedMode(decoded.currentMode);
+  updateWatchdogStatus(decoded.watchDog);
 
   setText('metric-loop-avg', `${decoded.loopTimeAvg ?? '--'} us`);
   setText('metric-loop-max', `Max ${decoded.loopTimeMax ?? '--'} us`);
   setText('metric-rssi', decoded.rssi ?? '--');
   setText('metric-mode', formatDroneState(decoded.currentMode));
   setText('metric-runtime', formatRuntime(decoded.runTime));
-  setText('metric-voltage', decoded.voltage ?? '--');
+  setText('metric-voltage', formatVoltage(Number(decoded.voltage)));
+  updateBatteryStatus(Number(decoded.voltage));
+  renderModeStatus();
+  updateModeRequestControl();
   setText('metric-motors', `${decoded.motor1Set ?? '--'} / ${decoded.motor2Set ?? '--'}`);
   setText('metric-gimbal', `${decoded.gimbalPitch ?? '--'} / ${decoded.gimbalYaw ?? '--'}`);
   setText('loop-chart-latest-avg', formatChartValue(Number(decoded.loopTimeAvg), 'us'));
@@ -856,7 +925,7 @@ function updateTelemetry(decoded) {
 
   const telemetryTable = $('#telemetry-table-body');
   telemetryTable.innerHTML = '';
-  for (const field of telemetrySchema.fields) {
+  for (const field of telemetrySchema.fields.filter((field) => !field.hidden)) {
     const row = document.createElement('tr');
     row.dataset.group = field.group;
     const displayValue = field.key === 'currentMode'
@@ -885,6 +954,258 @@ function updatePacketRate() {
   setText('metric-tx', state.txPackets);
   setText('metric-errors', state.badFrames);
   setText('last-telemetry-age', formatAge(state.lastTelemetryAt));
+
+  const stale = !state.lastTelemetryAt || now - state.lastTelemetryAt > TELEMETRY_STALE_MS;
+  for (const chip of [$('#header-battery'), $('#header-mode')]) {
+    chip.classList.toggle('stale', stale);
+    chip.title = stale ? `No telemetry for over ${TELEMETRY_STALE_MS / 1000} s` : '';
+  }
+
+  const live = state.connected || state.demoRunning;
+  if (stale && live && state.lastTelemetryAt && !state.linkLossReleased) releaseRequestOnLinkLoss();
+  if (!stale) state.linkLossReleased = false;
+  // Keeps the "requested" detail line honest while a request sits
+  // unacknowledged, which no telemetry sample would otherwise refresh.
+  if (state.pendingModeRequest !== null) renderModeStatus();
+}
+
+// The drone latches TRIPPED rather than reporting the SAFE transition alone,
+// precisely so the event survives the outage that caused it - over the radio
+// nothing arrives while the link is down, so the currentMode change and the
+// drone's own DEBUG_TEXT are already history by the time packets resume.
+// Alert on the latch.
+function updateWatchdogStatus(watchDog) {
+  const stat = $('#telemetry-watchdog');
+  if (!stat) return;
+
+  if (!watchDog) {
+    setText('metric-watchdog', '--');
+    stat.title = 'No telemetry';
+    stat.dataset.tone = '';
+    return;
+  }
+
+  const tripped = Boolean(watchDog.tripped);
+  const fed = Boolean(watchDog.fed);
+  setText('metric-watchdog', tripped ? 'Tripped' : fed ? 'Fed' : 'Starved');
+  stat.title = tripped
+    ? 'The watchdog expired while movement was allowed. Latched until the mode request is released to Safe.'
+    : fed
+      ? `A heartbeat arrived within the last ${WATCHDOG_TIMEOUT_MS} ms.`
+      : `No heartbeat for ${WATCHDOG_TIMEOUT_MS} ms.`;
+  stat.dataset.tone = tripped ? 'danger' : fed ? 'ok' : 'warning';
+
+  if (tripped && !state.lastWatchdogTripped) {
+    showToast('Comm watchdog tripped - the drone dropped to Safe. Request the flight mode again to resume.', 'error');
+    appendTerminal('Comm watchdog TRIPPED: the drone fell back to Safe', 'system');
+  }
+  state.lastWatchdogTripped = tripped;
+}
+
+function updateBatteryStatus(millivolts) {
+  const percent = batteryPercent(millivolts);
+  setText('header-voltage', formatVoltage(millivolts));
+  setText('header-battery-percent', percent === null ? 'No reading' : `${Math.round(percent)}%`);
+
+  let tone = '';
+  if (percent !== null && percent <= BATTERY_CRITICAL_PERCENT) tone = 'danger';
+  else if (percent !== null && percent <= BATTERY_LOW_PERCENT) tone = 'warning';
+  else if (percent !== null) tone = 'ok';
+  $('#header-battery').dataset.tone = tone;
+}
+
+const DRONE_STATE_TONES = {
+  [DRONE_STATES.SAFE]: 'ok',
+  [DRONE_STATES.READY_ARMED]: 'warning',
+  [DRONE_STATES.MAN_FLIGHT]: 'active',
+  [DRONE_STATES.AUTO_FLIGHT]: 'active',
+  [DRONE_STATES.FAULT_ERROR]: 'danger',
+};
+
+// Folds one telemetry sample's currentMode into the selector state. The
+// selector follows the drone whenever the drone moves on its own, and holds
+// the operator's request until the drone either honors it or overrules it.
+function applyReportedMode(mode) {
+  if (!Number.isFinite(mode)) return;
+  const previous = state.lastReportedMode;
+  state.lastReportedMode = mode;
+  if (mode === previous) return;
+
+  if (mode === state.pendingModeRequest) {
+    // Honored: from here the selector simply mirrors telemetry again.
+    clearPendingModeRequest();
+    return;
+  }
+
+  // Still moving through the armed states toward what was asked for (e.g.
+  // SAFE -> READY_ARMED on the way to MAN_FLIGHT) - the request stands, and
+  // repeating it in the heartbeat is a harmless keepalive.
+  if (state.pendingModeRequest !== null && ARMED_DRONE_STATES.includes(mode)) return;
+
+  clearPendingModeRequest();
+
+  // The drone moved by itself: a watchdog trip, a fault, its boot sequence,
+  // or a refused escalation. Release the heartbeat request to SAFE. That is
+  // not just cosmetic - TRIPPED only clears when the client asks for SAFE,
+  // and the SAFE -> flight edge needed to resume cannot exist until we do.
+  //
+  // An armed state is never adopted automatically. If the drone reports one
+  // while nothing is pending, the operator has to ask for it explicitly;
+  // adopting it would turn a telemetry gap into a silent re-arm.
+  if (!ARMED_DRONE_STATES.includes(mode)) state.requestedDroneState = DRONE_STATES.SAFE;
+}
+
+function clearPendingModeRequest() {
+  state.pendingModeRequest = null;
+  state.pendingModeRequestAt = null;
+}
+
+// Telemetry silence is treated as link loss: drop the request back to SAFE
+// and keep asserting SAFE while the link is down, per the firmware's
+// edge-triggered contract. Fires once per outage.
+function releaseRequestOnLinkLoss() {
+  state.linkLossReleased = true;
+  clearPendingModeRequest();
+  // Force the next sample through applyReportedMode's "changed" path so the
+  // selector resynchronizes with whatever the drone reports on return.
+  state.lastReportedMode = null;
+
+  if (state.requestedDroneState !== DRONE_STATES.SAFE) {
+    state.requestedDroneState = DRONE_STATES.SAFE;
+    showToast('Telemetry lost - the mode request was released to Safe. Request the flight mode again to resume.', 'warning');
+    appendTerminal('Link loss: requested state released to Safe', 'system');
+  }
+  updateModeRequestControl();
+  renderModeStatus();
+}
+
+function renderModeStatus() {
+  const reported = state.lastReportedMode;
+  const hasReported = Number.isFinite(reported);
+  const pending = state.pendingModeRequest;
+  // The dashboard automatically holds SAFE after a release, so an armed
+  // report with nothing pending means the drone has not acted on it yet.
+  const releasing = pending === null
+    && hasReported
+    && state.requestedDroneState === DRONE_STATES.SAFE
+    && ARMED_DRONE_STATES.includes(reported);
+
+  const chip = $('#header-mode');
+  chip.dataset.tone = hasReported ? (DRONE_STATE_TONES[reported] ?? '') : '';
+  chip.classList.toggle('pending', pending !== null || releasing);
+
+  let detail;
+  if (pending !== null) {
+    const reportedText = hasReported ? formatDroneState(reported) : 'no telemetry';
+    const waited = state.pendingModeRequestAt === null ? 0 : performance.now() - state.pendingModeRequestAt;
+    detail = waited > MODE_REQUEST_SLOW_MS
+      ? `Requested - drone still reports ${reportedText}, holding the request`
+      : `Requested - drone reports ${reportedText}`;
+  } else if (releasing) {
+    detail = `Requesting Safe - drone still reports ${formatDroneState(reported)}`;
+  } else if (!hasReported) {
+    detail = 'No telemetry';
+  } else {
+    detail = 'Reported by drone';
+  }
+  setText('header-mode-detail', detail);
+}
+
+function renderModeRequestOptions() {
+  const select = $('#mode-request');
+  for (const value of REQUESTABLE_DRONE_STATES) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = formatDroneState(value);
+    select.append(option);
+  }
+}
+
+// REQUESTABLE_DRONE_STATES cannot cover BOOT, the setup states or
+// FAULT_ERROR, but the selector is the only place the flight mode is shown,
+// so one disabled option is grafted in (and kept current) whenever the drone
+// reports a state the ground is not allowed to ask for.
+function syncReportedOnlyOption(select, value) {
+  const existing = $('option[data-reported-only]', select);
+  if (isRequestableState(value)) {
+    existing?.remove();
+    return;
+  }
+  const option = existing ?? document.createElement('option');
+  option.dataset.reportedOnly = 'true';
+  option.disabled = true;
+  option.value = String(value);
+  option.textContent = `${formatDroneState(value)} (reported)`;
+  if (!existing) select.prepend(option);
+}
+
+function updateModeRequestControl() {
+  const select = $('#mode-request');
+  select.disabled = !state.connected && !state.demoRunning;
+
+  // With nothing pending the selector mirrors telemetry exactly; with a
+  // request outstanding it shows what was asked for until the drone answers.
+  const displayed = state.pendingModeRequest
+    ?? (Number.isFinite(state.lastReportedMode) ? state.lastReportedMode : state.requestedDroneState);
+  syncReportedOnlyOption(select, displayed);
+  select.value = String(displayed);
+}
+
+function handleModeRequestChange(event) {
+  const value = Number(event.target.value);
+  if (!isRequestableState(value)) {
+    updateModeRequestControl();
+    return;
+  }
+  if (isFlightState(value)
+    && !window.confirm(`Request ${formatDroneState(value)}? The drone may start driving its motors and gimbal toward the last commanded target.`)) {
+    updateModeRequestControl();
+    return;
+  }
+  requestDroneState(value);
+}
+
+function requestDroneState(value) {
+  state.requestedDroneState = value;
+  // Asking for the state the drone already reports is a no-op for the
+  // firmware (no edge), so it is never shown as pending.
+  const alreadyThere = value === state.lastReportedMode;
+  state.pendingModeRequest = alreadyThere ? null : value;
+  state.pendingModeRequestAt = alreadyThere ? null : performance.now();
+  state.demoBootDone = true;
+
+  updateModeRequestControl();
+  renderModeStatus();
+  // Assert the new request now rather than on the next timer tick.
+  sendHeartbeat();
+}
+
+// Heartbeats bypass sendFrame's packet-monitor logging on every tick - tens of
+// rows a second would flush the 250-row log almost immediately - and are only
+// logged when the request they carry changes. Heartbeats wait for the identify
+// handshake, since the frame differs between direct and relay links.
+//
+// The requested state is re-asserted on every tick even though the firmware
+// acts on it only when it changes: a repeat is a pure keepalive, and it is
+// the keepalive that feeds the watchdog.
+async function sendHeartbeat() {
+  if (!state.connected || !state.linkMode) return;
+
+  const values = { requestedState: state.requestedDroneState };
+  const relay = state.linkMode === 'relay';
+  const type = relay ? USB_MESSAGE_TYPES.RADIO_PACKET : USB_MESSAGE_TYPES.HEARTBEAT;
+  const payload = relay ? encodeRadioHeartbeatEnvelope(values) : encodePayload(heartbeatSchema, values);
+
+  try {
+    if (values.requestedState !== state.lastLoggedHeartbeatRequest) {
+      state.lastLoggedHeartbeatRequest = values.requestedState;
+      await sendFrame(type, payload, values, relay ? 'Radio Heartbeat' : 'Heartbeat');
+    } else {
+      await link.send(type, payload);
+    }
+  } catch {
+    // The link dropped between ticks; the status event resets link state.
+  }
 }
 
 function resolvePacketSchema(packet) {
@@ -1066,10 +1387,10 @@ function commandValuesFromForm(forceMotorsOff = false) {
       targSlot: Number($('input[name="target-slot"]:checked').value) === 1,
       activeSlot: Number($('input[name="active-slot"]:checked').value) === 1,
     },
-    gimbalX: Number($('#gimbal-x').value),
-    gimbalY: Number($('#gimbal-y').value),
-    motor0Speed: motorsEnabled ? Number($('#motor-0').value) : 0,
-    motor1Speed: motorsEnabled ? Number($('#motor-1').value) : 0,
+    gimbalPitch: Number($('#gimbal-pitch').value),
+    gimbalYaw: Number($('#gimbal-yaw').value),
+    motorTopSpeed: motorsEnabled ? Number($('#motor-top').value) : 0,
+    motorBottomSpeed: motorsEnabled ? Number($('#motor-bottom').value) : 0,
     unused: 0,
   };
 }
@@ -1110,10 +1431,10 @@ function updateLiveSend() {
 async function emergencyStop() {
   $('#live-send').checked = false;
   $('#motor-enable').checked = false;
-  $('#motor-0').value = '0';
-  $('#motor-0-number').value = '0';
-  $('#motor-1').value = '0';
-  $('#motor-1-number').value = '0';
+  $('#motor-top').value = '0';
+  $('#motor-top-number').value = '0';
+  $('#motor-bottom').value = '0';
+  $('#motor-bottom-number').value = '0';
   updateLiveSend();
   await sendCommand(true);
   showToast('Zero-speed command sent and live transmission disabled', 'warning');
@@ -1448,13 +1769,24 @@ async function sendConfigApply() {
       return;
     }
 
-    const values = {
-      operation: CONFIG_OPS.SET,
-      entries: CONFIG_KEYS.map((entry) => ({ key: entry.id, value: configEntryValue(entry) })),
-    };
-    const payload = encodePayload(configSchema, values);
-    state.pendingDirectConfigResponses = 1;
-    await sendFrame(configSchema.id, payload, values, 'Config Set');
+    // usb_config_set carries at most CONFIG_SET_ENTRY_MAX entries (3 + 9 * 6
+    // fills the 60-byte payload), so the V3 key set no longer fits in one
+    // request. Chunk it like the read path; updateConfigFromResponse matches
+    // each reply's statuses by key, so the replies need no ordering.
+    const chunks = [];
+    for (let index = 0; index < CONFIG_KEYS.length; index += CONFIG_SET_ENTRY_MAX) {
+      chunks.push(CONFIG_KEYS.slice(index, index + CONFIG_SET_ENTRY_MAX));
+    }
+
+    state.pendingDirectConfigResponses = chunks.length;
+    for (const chunk of chunks) {
+      const values = {
+        operation: CONFIG_OPS.SET,
+        entries: chunk.map((entry) => ({ key: entry.id, value: configEntryValue(entry) })),
+      };
+      const payload = encodePayload(configSchema, values);
+      await sendFrame(configSchema.id, payload, values, 'Config Set');
+    }
   } catch (error) {
     showToast(error.message, 'error');
   } finally {
@@ -1530,6 +1862,39 @@ function updateConfigFromResponse(decoded) {
   }
 }
 
+// The demo walks the boot sequence into SAFE so the header chip and mode
+// table exercise the non-contiguous state values, then follows requests.
+const DEMO_MODE_CYCLE = [
+  DRONE_STATES.BOOT,
+  DRONE_STATES.RADIO_SETUP,
+  DRONE_STATES.SENSOR_SETUP,
+  DRONE_STATES.CONTROL_SETUP,
+  DRONE_STATES.SAFE,
+];
+
+// Mirrors the firmware closely enough to exercise the selector: the boot
+// walk runs until the first request, and requests are honored after a short
+// lag so the pending state is actually visible without hardware.
+function advanceDemoMode() {
+  const pending = state.pendingModeRequest;
+  if (pending !== null) {
+    const waited = performance.now() - (state.pendingModeRequestAt ?? 0);
+    if (waited >= DEMO_MODE_ACK_DELAY_MS) state.demoMode = pending;
+    return state.demoMode;
+  }
+
+  if (!state.demoBootDone) {
+    const index = Math.floor((performance.now() - state.demoStartedAt) / 2000);
+    state.demoMode = DEMO_MODE_CYCLE[Math.min(index, DEMO_MODE_CYCLE.length - 1)];
+    if (index >= DEMO_MODE_CYCLE.length - 1) state.demoBootDone = true;
+  }
+  // Once the boot walk is done the simulated drone honors whatever the
+  // dashboard is asserting, including a release back to SAFE.
+  else state.demoMode = state.requestedDroneState;
+
+  return state.demoMode;
+}
+
 function generateDemoTelemetry() {
   const t = performance.now() / 1000;
   const values = {
@@ -1537,14 +1902,18 @@ function generateDemoTelemetry() {
     loopTimeMax: Math.round(1320 + Math.sin(t * 0.8) * 95),
     runTime: Math.floor(t) & 0xffff,
     rssi: Math.round(72 + Math.sin(t * 0.4) * 7),
-    currentMode: Math.floor(t / 8) % 4,
+    currentMode: advanceDemoMode(),
+    // The simulated drone is always being fed, and never trips.
+    watchDog: { fed: true, tripped: false },
     gimbalPitch: Math.round(Math.sin(t * 0.7) * 1200),
     gimbalYaw: Math.round(Math.cos(t * 0.6) * 1600),
     topServoSet: Math.round(Math.sin(t * 0.7) * 900),
     bottomServoSet: Math.round(Math.cos(t * 0.6) * 900),
     motor1Set: Math.round(80 + Math.sin(t * 0.5) * 15),
     motor2Set: Math.round(82 + Math.cos(t * 0.5) * 15),
-    voltage: 0,
+    // Millivolts, draining 16.4 V to 13.0 V every 170 s to cycle the header's
+    // battery tones.
+    voltage: Math.round(16400 - ((t * 20) % 3400)),
     // A slowly-tumbling, genuinely normalized quaternion (axis-angle about a
     // fixed diagonal axis) - qR/qI/qJ/qK are dimensionless [-1, 1], scaled to
     // Q15 on the wire by encodePayload.
@@ -1600,6 +1969,9 @@ function toggleDemo() {
   if (state.demoRunning) {
     state.linkMode = 'direct';
     state.linkModeKnown = true;
+    state.demoMode = DRONE_STATES.BOOT;
+    state.demoBootDone = false;
+    state.demoStartedAt = performance.now();
     updateLinkModeDisplay();
     state.demoTimer = window.setInterval(generateDemoTelemetry, 100);
     $('#demo-button').textContent = 'Stop Demo';
@@ -1680,6 +2052,7 @@ function bindEvents() {
   });
   $('#serial-port').addEventListener('change', () => setConnectionStatus(state.connected));
   $('#demo-button').addEventListener('click', toggleDemo);
+  $('#mode-request').addEventListener('change', handleModeRequestChange);
   $('#send-command').addEventListener('click', () => sendCommand(false));
   $('#emergency-stop').addEventListener('click', emergencyStop);
   $('#live-send').addEventListener('change', updateLiveSend);
@@ -1729,10 +2102,10 @@ function bindEvents() {
     if (orientationView) orientationView.resize();
   });
 
-  syncRangePair('gimbal-x', 'gimbal-x-number');
-  syncRangePair('gimbal-y', 'gimbal-y-number');
-  syncRangePair('motor-0', 'motor-0-number');
-  syncRangePair('motor-1', 'motor-1-number');
+  syncRangePair('gimbal-pitch', 'gimbal-pitch-number');
+  syncRangePair('gimbal-yaw', 'gimbal-yaw-number');
+  syncRangePair('motor-top', 'motor-top-number');
+  syncRangePair('motor-bottom', 'motor-bottom-number');
 }
 
 link.addEventListener('bridge', (event) => {
@@ -1792,6 +2165,9 @@ link.addEventListener('error', (event) => {
 function initialize() {
   bindTabs();
   bindEvents();
+  renderModeRequestOptions();
+  renderModeStatus();
+  updateWatchdogStatus(null);
   renderGenericBuilder();
   renderConfigForm();
   initializeMap();
@@ -1801,6 +2177,7 @@ function initialize() {
   renderCharts();
 
   window.setInterval(updatePacketRate, 250);
+  window.setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
   appendTerminal('Dashboard ready. Connecting to the server-side serial bridge...', 'system');
   appendTerminal(`Loaded ${PACKET_SCHEMAS.length} packet schemas.`, 'system');
   link.start();

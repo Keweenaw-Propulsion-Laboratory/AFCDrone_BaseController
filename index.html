@@ -49,6 +49,21 @@
         <div id="connection-badge" class="connection-badge"><span id="connection-dot" class="status-dot"></span>Server Offline</div>
         <span id="link-mode-status" class="link-mode-badge">Link: Not connected</span>
       </div>
+      <div class="vehicle-status">
+        <div id="header-battery" class="vehicle-chip">
+          <span class="vehicle-chip-label">Battery</span>
+          <strong id="header-voltage">--</strong>
+          <span id="header-battery-percent" class="vehicle-chip-detail">No reading</span>
+        </div>
+        <!-- One control for both halves of the flight mode: the selector shows
+             what the drone reports, and switches to the requested state (with
+             a pending highlight) until telemetry confirms the change. -->
+        <div id="header-mode" class="vehicle-chip mode-chip">
+          <span class="vehicle-chip-label" id="header-mode-label">Flight mode</span>
+          <select id="mode-request" aria-labelledby="header-mode-label" disabled></select>
+          <span id="header-mode-detail" class="vehicle-chip-detail">No telemetry</span>
+        </div>
+      </div>
     </header>
 
     <div id="server-warning" class="warning-banner">
@@ -206,13 +221,14 @@
           <div class="panel-heading">
             <div>
               <h2>Latest telemetry</h2>
-              <p>Decoded from the packed 54-byte telemetry structure</p>
+              <p>Decoded from the packed 64-byte telemetry structure</p>
             </div>
             <div class="stats-inline">
               <span>RX <strong id="metric-rx">0</strong></span>
               <span>TX <strong id="metric-tx">0</strong></span>
               <span>Parse errors <strong id="metric-errors">0</strong></span>
               <span>Voltage <strong id="metric-voltage">--</strong></span>
+              <span id="telemetry-watchdog" title="No telemetry">Comm watchdog <strong id="metric-watchdog">--</strong></span>
             </div>
           </div>
           <div class="table-wrap">
@@ -250,20 +266,20 @@
               </fieldset>
 
               <label class="field field-span-2">
-                <span>Gimbal X (deg)</span>
-                <div class="range-pair"><input id="gimbal-x" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-x-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
+                <span>Gimbal pitch (deg)</span>
+                <div class="range-pair"><input id="gimbal-pitch" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-pitch-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Gimbal Y (deg)</span>
-                <div class="range-pair"><input id="gimbal-y" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-y-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
+                <span>Gimbal yaw (deg)</span>
+                <div class="range-pair"><input id="gimbal-yaw" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-yaw-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Motor 0 speed</span>
-                <div class="range-pair"><input id="motor-0" type="range" min="0" max="255" value="0"><input id="motor-0-number" type="number" min="0" max="255" value="0"></div>
+                <span>Top motor speed</span>
+                <div class="range-pair"><input id="motor-top" type="range" min="0" max="255" value="0"><input id="motor-top-number" type="number" min="0" max="255" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Motor 1 speed</span>
-                <div class="range-pair"><input id="motor-1" type="range" min="0" max="255" value="0"><input id="motor-1-number" type="number" min="0" max="255" value="0"></div>
+                <span>Bottom motor speed</span>
+                <div class="range-pair"><input id="motor-bottom" type="range" min="0" max="255" value="0"><input id="motor-bottom-number" type="number" min="0" max="255" value="0"></div>
               </label>
             </div>
 
@@ -345,7 +361,6 @@
               <button id="clear-packets" class="secondary" type="button">Clear</button>
             </div>
           </div>
-          <label class="compatibility-option"><input id="compat-telemetry" type="checkbox" checked><span>Treat 54-byte DEBUG_TEXT packets as telemetry until the firmware type-field bug is fixed</span></label>
           <div class="table-wrap">
             <table class="data-table packet-table">
               <thead><tr><th>Time</th><th>Dir</th><th>#</th><th>Type</th><th>Bytes</th><th>Summary</th><th></th></tr></thead>

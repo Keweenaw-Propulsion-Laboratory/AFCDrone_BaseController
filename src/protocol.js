@@ -12,10 +12,23 @@ export const FRAME_PREFIX_SIZE = PAYLOAD_OFFSET;
 export const CRC_SIZE = 2;
 export const FRAME_OVERHEAD = FRAME_PREFIX_SIZE + CRC_SIZE;
 export const MIN_FRAME_SIZE = FRAME_OVERHEAD;
-export const MAX_PAYLOAD_SIZE = 60;
+// Raised from 60 to 64 alongside the 64-byte TELEMETRY record. A relay that
+// forwards these frames over a UART needs room for a whole maximum frame in
+// its TX buffer (SERIAL_TX_BUFFER_SIZE >= MAX_FRAME_SIZE + 1): availableForWrite()
+// can never exceed SERIAL_TX_BUFFER_SIZE - 1, so an oversized frame is never
+// written, never popped, and wedges the queue behind it forever.
+export const MAX_PAYLOAD_SIZE = 64;
+export const MAX_FRAME_SIZE = FRAME_OVERHEAD + MAX_PAYLOAD_SIZE;
+
+// CONFIG deliberately did NOT grow with the ceiling: both the request and the
+// read response stay at 60 bytes, which is what the firmware's handler sizes
+// its buffers for.
+export const CONFIG_MAX_PAYLOAD_SIZE = 60;
 
 export const COMMAND_PAYLOAD_SIZE = 8;
-export const TELEMETRY_PAYLOAD_SIZE = 54;
+// Extended from 54 to 64: every pre-existing field kept its offset and the
+// record grew at the tail (watchDog at 54, then 9 reserved bytes).
+export const TELEMETRY_PAYLOAD_SIZE = 64;
 export const COMMAND_FRAME_SIZE = FRAME_OVERHEAD + COMMAND_PAYLOAD_SIZE;
 export const TELEMETRY_FRAME_SIZE = FRAME_OVERHEAD + TELEMETRY_PAYLOAD_SIZE;
 
@@ -34,6 +47,10 @@ export const USB_MESSAGE_TYPES = Object.freeze({
   TELEMETRY: 3,
   COMMAND: 4,
   CONFIG: 5,
+  // 6-9 are unused: HEARTBEAT deliberately shares the RF message number so
+  // the same 8 bytes carry the same type id on both links (AFC-Drone
+  // include/usb.h - "Same as Radio").
+  HEARTBEAT: 10,
 });
 
 // RadioHead header-flags values used on the RF69 link itself (distinct from
@@ -49,6 +66,7 @@ export const RADIO_MESSAGE_TYPES = Object.freeze({
   STATUS6: 7,
   COMMAND: 8,
   CONFIG: 9,
+  HEARTBEAT: 10,
 });
 
 export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
@@ -62,6 +80,7 @@ export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
   [RADIO_MESSAGE_TYPES.STATUS6]: 'Status6',
   [RADIO_MESSAGE_TYPES.COMMAND]: 'Command',
   [RADIO_MESSAGE_TYPES.CONFIG]: 'Config',
+  [RADIO_MESSAGE_TYPES.HEARTBEAT]: 'Heartbeat',
 });
 
 // The connection-identify handshake reuses USB_MESSAGE_TYPES.RAW, which no
@@ -78,9 +97,16 @@ export const DRONE_STATES = Object.freeze({
   RADIO_SETUP: 1,
   SENSOR_SETUP: 2,
   CONTROL_SETUP: 3,
-  READY_ARMED: 4,
-  FLIGHT: 5,
-  FAULT_ERROR: 6,
+  // No movement allowed but all systems go.
+  SAFE: 4,
+  // Gimbal movement allowed.
+  READY_ARMED: 10,
+  // Manual motors and gimbal.
+  MAN_FLIGHT: 11,
+  // Flight-control driven motors and gimbal.
+  AUTO_FLIGHT: 12,
+  // Unrecoverable error has occurred.
+  FAULT_ERROR: 255,
 });
 
 export const DRONE_STATE_NAMES = Object.freeze({
@@ -88,22 +114,126 @@ export const DRONE_STATE_NAMES = Object.freeze({
   [DRONE_STATES.RADIO_SETUP]: 'Radio Setup',
   [DRONE_STATES.SENSOR_SETUP]: 'Sensor Setup',
   [DRONE_STATES.CONTROL_SETUP]: 'Control Setup',
+  [DRONE_STATES.SAFE]: 'Safe',
   [DRONE_STATES.READY_ARMED]: 'Ready / Armed',
-  [DRONE_STATES.FLIGHT]: 'Flight',
+  [DRONE_STATES.MAN_FLIGHT]: 'Manual Flight',
+  [DRONE_STATES.AUTO_FLIGHT]: 'Auto Flight',
   [DRONE_STATES.FAULT_ERROR]: 'Fault Error',
 });
+
+// The states that drive the motors or gimbal, so the dashboard can gate
+// confirmations and config reads on "is the vehicle live?" rather than on one
+// specific state.
+export const ARMED_DRONE_STATES = Object.freeze([
+  DRONE_STATES.READY_ARMED,
+  DRONE_STATES.MAN_FLIGHT,
+  DRONE_STATES.AUTO_FLIGHT,
+]);
+
+export const FLIGHT_DRONE_STATES = Object.freeze([
+  DRONE_STATES.MAN_FLIGHT,
+  DRONE_STATES.AUTO_FLIGHT,
+]);
+
+export function isFlightState(value) {
+  return FLIGHT_DRONE_STATES.includes(value);
+}
 
 export function formatDroneState(value) {
   if (value === undefined || value === null) return '--';
   return DRONE_STATE_NAMES[value] ?? `Unknown (${value})`;
 }
 
+// Only these can be requested from the ground; the setup states are the
+// firmware's own boot sequence and FAULT_ERROR is entered, never asked for.
+export const REQUESTABLE_DRONE_STATES = Object.freeze([
+  DRONE_STATES.SAFE,
+  DRONE_STATES.READY_ARMED,
+  DRONE_STATES.MAN_FLIGHT,
+  DRONE_STATES.AUTO_FLIGHT,
+]);
+
+export function isRequestableState(value) {
+  return REQUESTABLE_DRONE_STATES.includes(value);
+}
+
+// HEARTBEAT byte 0 carries the requested Drone::States. The firmware acts on
+// it only when it CHANGES - a repeat of the last requested state is a pure
+// keepalive. There is therefore no "no request" value any more: a client
+// always asserts something, and SAFE is the value it asserts when it is not
+// asking for anything, because a heartbeat sent before a dropout is otherwise
+// byte-identical to one sent after it and would silently re-arm the vehicle
+// the moment a link came back.
+export const HEARTBEAT_PAYLOAD_SIZE = 8;
+export const HEARTBEAT_DEFAULT_STATE_REQUEST = DRONE_STATES.SAFE;
+
+// Only HEARTBEAT (type 10) feeds the drone's link watchdog, and the watchdog
+// expires this long after the last one. COMMAND traffic does not feed it.
+// Evaluated only at or above READY_ARMED.
+export const WATCHDOG_TIMEOUT_MS = 100;
+
+// The firmware's recommended heartbeat cadence; comfortably inside
+// WATCHDOG_TIMEOUT_MS even after a couple of consecutive losses.
+export const HEARTBEAT_INTERVAL_MS = 25;
+
+// An escalation out of SAFE is refused until the vehicle has been in SAFE for
+// this long. The refusal does not consume the request - holding the new state
+// gets it honored on the first heartbeat after the dwell passes.
+export const ESCALATION_DWELL_MS = 500;
+
+// The watchDog flag byte, identical on both transports: TELEMETRY offset 54
+// and RF STATUS0 offset 7. Bits 2-7 are reserved and transmitted as zero.
+export const WATCHDOG_BITS = Object.freeze({
+  // Live and self-clearing: a heartbeat arrived within WATCHDOG_TIMEOUT_MS.
+  FED: 0,
+  // Latched: the watchdog expired while movement was allowed. Cleared only
+  // when the client releases its requested state back to SAFE. Alert on this
+  // rather than on the currentMode transition - over the radio nothing
+  // arrives while the link is down, so the transition and the drone's
+  // DEBUG_TEXT are both already in the past by the time packets resume.
+  TRIPPED: 1,
+});
+
+// One shared descriptor so TELEMETRY and STATUS0 decode the byte identically.
+function watchDogField(overrides = {}) {
+  return {
+    key: 'watchDog',
+    label: 'Comm watchdog',
+    type: 'bitfield8',
+    bits: [
+      { key: 'fed', label: 'Fed', bit: WATCHDOG_BITS.FED, default: false },
+      { key: 'tripped', label: 'Tripped', bit: WATCHDOG_BITS.TRIPPED, default: false },
+    ],
+    ...overrides,
+  };
+}
+
+// TELEMETRY/STATUS2 `voltage` is battery millivolts; 0 means the drone is not
+// reporting it yet. The percentage is linear over the 4S LiPo range used by
+// AFC-Drone's BatteryMonitor work (src/battery.cpp), as are the thresholds.
+export const BATTERY_MIN_MV = 13090;
+export const BATTERY_MAX_MV = 16500;
+export const BATTERY_LOW_PERCENT = 40;
+export const BATTERY_CRITICAL_PERCENT = 20;
+
+export function batteryPercent(millivolts) {
+  if (!Number.isFinite(millivolts) || millivolts <= 0) return null;
+  const percent = ((millivolts - BATTERY_MIN_MV) / (BATTERY_MAX_MV - BATTERY_MIN_MV)) * 100;
+  return Math.min(100, Math.max(0, percent));
+}
+
+export function formatVoltage(millivolts) {
+  if (!Number.isFinite(millivolts) || millivolts <= 0) return '--';
+  return `${(millivolts / 1000).toFixed(2)} V`;
+}
+
 // The persistent-config wire version, versioned independently of the USB
 // framing PROTOCOL_VERSION. This is AFC-Drone's CONFIG_VERSION (src/configs.cpp)
 // and both the USB and radio firmware handlers reject any config request whose
 // version byte does not match theirs with ConfigResult::UNKNOWN_VERSION. V2
-// added DebugMode at key 0 and moved TxPowerDbm after the booleans.
-export const CONFIG_VERSION = 2;
+// added DebugMode at key 0 and moved TxPowerDbm after the booleans. V3
+// appended gyroEnabled, leaving every V2 field at the offset it already had.
+export const CONFIG_VERSION = 3;
 
 export const CONFIG_OPS = Object.freeze({
   READ: 0x01,
@@ -144,6 +274,8 @@ export const CONFIG_KEYS = Object.freeze([
   { id: 6, key: 'GimbalYawOffset', label: 'Gimbal yaw offset', kind: 'int', min: 60, max: 120, default: 89, unit: 'deg', effect: 'Yaw-servo center/setpoint offset in degrees.' },
   { id: 7, key: 'Motor1Offset', label: 'Motor 1 offset (top)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Top-motor speed adjustment.' },
   { id: 8, key: 'Motor2Offset', label: 'Motor 2 offset (bottom)', kind: 'int', min: -100, max: 100, default: 0, effect: 'Bottom-motor speed adjustment.' },
+  // Appended by config V3, never reordered - these ids go out on the wire.
+  { id: 9, key: 'GyroEnabled', label: 'Gyro enabled', kind: 'bool', default: 0, effect: 'Enables the BNO08x IMU. Disabled boots with no IMU fitted.' },
 ]);
 
 export function getConfigKeyById(id) {
@@ -179,8 +311,8 @@ function encodeConfigPayload(values = {}) {
     offset += entrySize;
   }
 
-  if (payload.byteLength > MAX_PAYLOAD_SIZE) {
-    throw new Error(`Config payload is ${payload.byteLength} bytes; maximum is ${MAX_PAYLOAD_SIZE}`);
+  if (payload.byteLength > CONFIG_MAX_PAYLOAD_SIZE) {
+    throw new Error(`Config payload is ${payload.byteLength} bytes; maximum is ${CONFIG_MAX_PAYLOAD_SIZE}`);
   }
   return payload;
 }
@@ -245,7 +377,9 @@ const RADIO_STATUS_SCHEMAS = {
       { key: 'loopTimeMax', type: 'uint16' },
       { key: 'runTime', type: 'uint16' },
       { key: 'currentMode', type: 'uint8' },
-      { key: 'reserved' , type: 'uint8', hidden: true},
+      // Byte 7 always existed and was always zero; it now carries the
+      // watchdog flags. No change to the 8-byte RF wire size.
+      watchDogField(),
     ],
   },
   [RADIO_MESSAGE_TYPES.STATUS1]: {
@@ -325,6 +459,9 @@ export function decodeRadioMessage(radioMessageType, bytes) {
   if (radioMessageType === RADIO_MESSAGE_TYPES.COMMAND) {
     return decodePayload(getSchemaById(USB_MESSAGE_TYPES.COMMAND), bytes);
   }
+  if (radioMessageType === RADIO_MESSAGE_TYPES.HEARTBEAT) {
+    return decodePayload(getSchemaById(USB_MESSAGE_TYPES.HEARTBEAT), bytes);
+  }
   if (radioMessageType === RADIO_MESSAGE_TYPES.CONFIG) {
     return decodePayload(RADIO_CONFIG_SCHEMA, bytes);
   }
@@ -339,6 +476,9 @@ export function decodeRadioMessage(radioMessageType, bytes) {
 export function encodeRadioMessage(radioMessageType, values) {
   if (radioMessageType === RADIO_MESSAGE_TYPES.COMMAND) {
     return encodePayload(getSchemaById(USB_MESSAGE_TYPES.COMMAND), values);
+  }
+  if (radioMessageType === RADIO_MESSAGE_TYPES.HEARTBEAT) {
+    return encodePayload(getSchemaById(USB_MESSAGE_TYPES.HEARTBEAT), values);
   }
   if (radioMessageType === RADIO_MESSAGE_TYPES.CONFIG) {
     return encodePayload(RADIO_CONFIG_SCHEMA, values);
@@ -431,7 +571,7 @@ export const PACKET_SCHEMAS = [
 
       { key: 'motor1Set', label: 'Bottom motor setpoint', type: 'uint8', unit: '', group: 'Power' },
       { key: 'motor2Set', label: 'Top motor setpoint', type: 'uint8', unit: '', group: 'Power' },
-      { key: 'voltage', label: 'Voltage', type: 'uint16', unit: '', group: 'Power' },
+      { key: 'voltage', label: 'Voltage', type: 'uint16', unit: 'mV', group: 'Power' },
 
       { key: 'qR', label: 'Quaternion R', type: 'int16', unit: '', group: 'Quaternion', scale: QUATERNION_SCALE, min: -1, max: 1, precision: 4 },
       { key: 'qI', label: 'Quaternion I', type: 'int16', unit: '', group: 'Quaternion', scale: QUATERNION_SCALE, min: -1, max: 1, precision: 4 },
@@ -452,6 +592,11 @@ export const PACKET_SCHEMAS = [
 
       { key: 'latitude', label: 'Latitude', type: 'float32', unit: 'deg', group: 'GPS', precision: 7 },
       { key: 'longitude', label: 'Longitude', type: 'float32', unit: 'deg', group: 'GPS', precision: 7 },
+
+      // Appended when the record grew 54 -> 64; everything above keeps the
+      // offset it already had.
+      watchDogField({ group: 'Status' }),
+      { key: 'reserved', label: 'Reserved', type: 'bytes', length: 9, default: new Uint8Array(9), hidden: true, group: 'Status' },
     ],
   },
   {
@@ -473,10 +618,10 @@ export const PACKET_SCHEMAS = [
       // The flight loop divides the raw wire value by 1638.0, yielding
       // approximately +-20 degrees - encode/decode work in degrees directly
       // via the field's scale factor (see encodePayload/decodePayload).
-      { key: 'gimbalX', label: 'Gimbal X', type: 'int16', unit: 'deg', min: -20, max: 20, step: 0.1, default: 0, scale: 1638, group: 'Command' },
-      { key: 'gimbalY', label: 'Gimbal Y', type: 'int16', unit: 'deg', min: -20, max: 20, step: 0.1, default: 0, scale: 1638, group: 'Command' },
-      { key: 'motor0Speed', label: 'Motor 0 speed', type: 'uint8', min: 0, max: 255, step: 1, default: 0, group: 'Command' },
-      { key: 'motor1Speed', label: 'Motor 1 speed', type: 'uint8', min: 0, max: 255, step: 1, default: 0, group: 'Command' },
+      { key: 'gimbalPitch', label: 'Gimbal pitch', type: 'int16', unit: 'deg', min: -20, max: 20, step: 0.1, default: 0, scale: 1638, group: 'Command' },
+      { key: 'gimbalYaw', label: 'Gimbal yaw', type: 'int16', unit: 'deg', min: -20, max: 20, step: 0.1, default: 0, scale: 1638, group: 'Command' },
+      { key: 'motorTopSpeed', label: 'Top motor speed', type: 'uint8', min: 0, max: 255, step: 1, default: 0, group: 'Command' },
+      { key: 'motorBottomSpeed', label: 'Bottom motor speed', type: 'uint8', min: 0, max: 255, step: 1, default: 0, group: 'Command' },
       { key: 'unused', label: 'Reserved', type: 'uint8', default: 0, hidden: true, group: 'Command' },
     ],
   },
@@ -488,6 +633,18 @@ export const PACKET_SCHEMAS = [
     builderHidden: true,
     encoder: encodeConfigPayload,
     decoder: decodeConfigPayload,
+  },
+  {
+    id: USB_MESSAGE_TYPES.HEARTBEAT,
+    name: 'Heartbeat',
+    direction: 'out',
+    payloadSize: HEARTBEAT_PAYLOAD_SIZE,
+    // Sent on a fixed timer by the dashboard itself, never by hand.
+    builderHidden: true,
+    fields: [
+      { key: 'requestedState', label: 'Requested state', type: 'uint8', default: HEARTBEAT_DEFAULT_STATE_REQUEST, group: 'Heartbeat' },
+      { key: 'reserved', label: 'Reserved', type: 'bytes', length: 7, default: new Uint8Array(7), hidden: true, group: 'Heartbeat' },
+    ],
   },
 ];
 
