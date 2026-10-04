@@ -41,6 +41,7 @@ import {
 } from '../src/radio-relay.js';
 import { PacketStreamParser } from '../src/serial-link.js';
 import { quaternionToEulerDegrees } from '../src/orientation-math.js';
+import { applyDeadzone, gamepadToCommand, isSouthPressed } from '../src/gamepad.js';
 
 assert.equal(crc16CcittFalse(new TextEncoder().encode('123456789')), 0x29b1);
 assert.equal(FRAME_OVERHEAD, 9);
@@ -531,5 +532,42 @@ const roll90 = quaternionToEulerDegrees(half90, 0, 0, half90);
 assert.ok(Math.abs(roll90.roll - 90) < 1e-6, `expected roll ~90, got ${roll90.roll}`);
 assert.ok(Math.abs(roll90.pitch) < 1e-6);
 assert.ok(Math.abs(roll90.yaw) < 1e-6);
+
+// --- gamepadToCommand: standard-layout controller mapping ---
+
+function fakeGamepad({ axes = [0, 0, 0, 0], rt = 0, south = false } = {}) {
+  const buttons = Array.from({ length: 17 }, () => ({ pressed: false, value: 0 }));
+  buttons[0] = { pressed: south, value: south ? 1 : 0 };
+  buttons[7] = { pressed: rt > 0, value: rt };
+  return { axes, buttons };
+}
+
+assert.equal(applyDeadzone(0.05, 0.08), 0);
+assert.equal(applyDeadzone(1, 0.08), 1);
+assert.equal(applyDeadzone(-1, 0.08), -1);
+
+const idle = gamepadToCommand(fakeGamepad());
+assert.deepEqual(idle, { gimbalX: 0, gimbalY: 0, motor0Speed: 0, motor1Speed: 0 });
+
+// Stick up (-1 on the standard Y axis) is positive gimbal Y.
+const fullGimbal = gamepadToCommand(fakeGamepad({ axes: [1, -1, 0, 0] }));
+assert.equal(fullGimbal.gimbalX, 20);
+assert.equal(fullGimbal.gimbalY, 20);
+
+const fullThrottle = gamepadToCommand(fakeGamepad({ rt: 1 }));
+assert.equal(fullThrottle.motor0Speed, 255);
+assert.equal(fullThrottle.motor1Speed, 255);
+
+const halfThrottleRight = gamepadToCommand(fakeGamepad({ rt: 0.515, axes: [0, 0, 1, 0] }));
+assert.equal(halfThrottleRight.motor1Speed, 0);
+assert.ok(halfThrottleRight.motor0Speed > 250, `expected ~255, got ${halfThrottleRight.motor0Speed}`);
+
+// Differential without throttle must never spin a motor.
+const differentialOnly = gamepadToCommand(fakeGamepad({ axes: [0, 0, -1, 0] }));
+assert.equal(differentialOnly.motor0Speed, 0);
+assert.equal(differentialOnly.motor1Speed, 0);
+
+assert.equal(isSouthPressed(fakeGamepad({ south: true })), true);
+assert.equal(isSouthPressed(fakeGamepad()), false);
 
 console.log('Protocol framing and payload decoder tests passed');

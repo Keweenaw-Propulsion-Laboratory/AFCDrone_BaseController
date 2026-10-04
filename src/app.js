@@ -33,6 +33,12 @@ import {
   RADIO_CONFIG_REQUEST_TIMEOUT_MS,
   RADIO_CONFIG_MAX_ATTEMPTS,
 } from './radio-relay.js';
+import {
+  ARM_THROTTLE_LIMIT,
+  gamepadToCommand,
+  isSouthPressed,
+  readThrottle,
+} from './gamepad.js';
 // Dynamically imported in initializeOrientationView() - orientation-view.js
 // itself pulls Three.js from a CDN, and a static top-level import would take
 // the whole dashboard down on a CDN hiccup instead of just the 3D tab.
@@ -109,6 +115,12 @@ let mapTileError = false;
 
 let orientationView = null;
 let orientationModule = null;
+
+const gamepadState = {
+  index: null,
+  frame: null,
+  southWasPressed: false,
+};
 
 function setText(id, value) {
   const element = document.getElementById(id);
@@ -1107,7 +1119,8 @@ function updateLiveSend() {
   if (enabled) state.liveTimer = window.setInterval(() => sendCommand(false), 1000 / rate);
 }
 
-async function emergencyStop() {
+async function emergencyStop(message = 'Zero-speed command sent and live transmission disabled') {
+  $('#gamepad-enable').checked = false;
   $('#live-send').checked = false;
   $('#motor-enable').checked = false;
   $('#motor-0').value = '0';
@@ -1116,7 +1129,112 @@ async function emergencyStop() {
   $('#motor-1-number').value = '0';
   updateLiveSend();
   await sendCommand(true);
-  showToast('Zero-speed command sent and live transmission disabled', 'warning');
+  showToast(message, 'warning');
+}
+
+function setRangePair(rangeId, value) {
+  document.getElementById(rangeId).value = String(value);
+  document.getElementById(`${rangeId}-number`).value = String(value);
+}
+
+function currentGamepad() {
+  if (gamepadState.index === null) return null;
+  return navigator.getGamepads?.()[gamepadState.index] ?? null;
+}
+
+function updateGamepadStatus() {
+  const gamepad = currentGamepad();
+  const checkbox = $('#gamepad-enable');
+  checkbox.disabled = !gamepad;
+  if (!gamepad) {
+    setText('gamepad-status', 'No controller detected - press any button on it');
+    return;
+  }
+  const layout = gamepad.mapping === 'standard' ? '' : ' (non-standard layout - mapping may be wrong)';
+  setText('gamepad-status', `${checkbox.checked ? 'Armed' : 'Connected'}: ${gamepad.id}${layout}`);
+}
+
+// The south button is always live while a controller is connected, armed or
+// not, so it works as a hardware kill switch.
+function pollGamepad() {
+  gamepadState.frame = window.requestAnimationFrame(pollGamepad);
+  const gamepad = currentGamepad();
+  if (!gamepad) return;
+
+  const southPressed = isSouthPressed(gamepad);
+  if (southPressed && !gamepadState.southWasPressed) {
+    emergencyStop('Safe mode: controller south button pressed');
+    updateGamepadStatus();
+  }
+  gamepadState.southWasPressed = southPressed;
+
+  if (!$('#gamepad-enable').checked) return;
+  const values = gamepadToCommand(gamepad);
+  setRangePair('gimbal-x', values.gimbalX);
+  setRangePair('gimbal-y', values.gimbalY);
+  setRangePair('motor-0', values.motor0Speed);
+  setRangePair('motor-1', values.motor1Speed);
+}
+
+function handleGamepadArmToggle() {
+  const checkbox = $('#gamepad-enable');
+  if (!checkbox.checked) {
+    if (state.connected || state.demoRunning) emergencyStop('Gamepad disarmed - zero-speed command sent');
+    updateGamepadStatus();
+    return;
+  }
+
+  const gamepad = currentGamepad();
+  let refusal = null;
+  if (!gamepad) refusal = 'No controller connected';
+  else if (!state.connected && !state.demoRunning) refusal = 'Connect the server serial port or start demo mode first';
+  else if (readThrottle(gamepad) > ARM_THROTTLE_LIMIT) refusal = 'Release the right trigger before arming';
+  else if (isSouthPressed(gamepad)) refusal = 'Release the south button before arming';
+  if (refusal) {
+    checkbox.checked = false;
+    showToast(refusal, 'error');
+    return;
+  }
+
+  gamepadState.southWasPressed = false;
+  $('#live-send').checked = true;
+  updateLiveSend();
+  updateGamepadStatus();
+  showToast('Gamepad armed - streaming commands at the continuous-send rate', 'info');
+}
+
+function bindGamepad() {
+  window.addEventListener('gamepadconnected', (event) => {
+    if (gamepadState.index === null) {
+      gamepadState.index = event.gamepad.index;
+      gamepadState.southWasPressed = isSouthPressed(event.gamepad);
+      appendTerminal(`Controller connected: ${event.gamepad.id}`, 'system');
+    }
+    if (gamepadState.frame === null) pollGamepad();
+    updateGamepadStatus();
+  });
+
+  window.addEventListener('gamepaddisconnected', (event) => {
+    if (event.gamepad.index !== gamepadState.index) return;
+    const wasArmed = $('#gamepad-enable').checked;
+    gamepadState.index = null;
+    window.cancelAnimationFrame(gamepadState.frame);
+    gamepadState.frame = null;
+    appendTerminal(`Controller disconnected: ${event.gamepad.id}`, 'system');
+    if (wasArmed) emergencyStop('Safe mode: armed controller disconnected');
+    updateGamepadStatus();
+  });
+
+  // requestAnimationFrame stops in a hidden tab, so the controller would stop
+  // being read while continuous send kept repeating its last values.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && $('#gamepad-enable').checked) {
+      emergencyStop('Safe mode: dashboard tab hidden while gamepad was armed');
+      updateGamepadStatus();
+    }
+  });
+
+  $('#gamepad-enable').addEventListener('change', handleGamepadArmToggle);
 }
 
 function renderGenericBuilder() {
@@ -1681,7 +1799,10 @@ function bindEvents() {
   $('#serial-port').addEventListener('change', () => setConnectionStatus(state.connected));
   $('#demo-button').addEventListener('click', toggleDemo);
   $('#send-command').addEventListener('click', () => sendCommand(false));
-  $('#emergency-stop').addEventListener('click', emergencyStop);
+  $('#emergency-stop').addEventListener('click', () => {
+    emergencyStop();
+    updateGamepadStatus();
+  });
   $('#live-send').addEventListener('change', updateLiveSend);
   $('#live-rate').addEventListener('change', updateLiveSend);
   $('#schema-select').addEventListener('change', renderSchemaFields);
@@ -1792,6 +1913,7 @@ link.addEventListener('error', (event) => {
 function initialize() {
   bindTabs();
   bindEvents();
+  bindGamepad();
   renderGenericBuilder();
   renderConfigForm();
   initializeMap();

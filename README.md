@@ -13,6 +13,7 @@ The drone connects by USB serial to the computer running the dashboard server. T
 - Satellite position map using telemetry latitude and longitude
 - Target-slot, gimbal, and motor command controls
 - Motor-output safety interlock and emergency stop action
+- Game controller control of gimbal and motors, with a safe-mode button
 - Optional continuous command transmission from 1 to 50 Hz
 - CRC-validated framed packet parser with automatic resynchronization
 - RX/TX packet monitor with raw frame, payload, and decoded-field views
@@ -211,6 +212,19 @@ The command panel sends type `4` command packets containing:
 Nonzero motor output is blocked until the motor-output interlock is enabled. The **Stop Motors** action immediately sets both motor commands to zero and transmits a command frame.
 
 Continuous transmission can be enabled at a configurable rate from 1 to 50 Hz.
+
+### Game controller
+
+Any controller the browser exposes with the standard Gamepad API layout (Xbox, PlayStation, and most others) can drive the command form. Press a button on the controller after the page loads so the browser detects it. Then turn on **Gamepad control** in the Commands tab.
+
+| Input | Effect |
+| --- | --- |
+| Left stick | Gimbal X / Y, absolute: centered is 0°, full deflection is ±20° (stick up is +Y) |
+| Right trigger | Throttle for both motors (0–255) |
+| Right stick X | Motor differential, scaled by throttle: right gives more motor 0, left gives more motor 1 |
+| South button (A / ✕) | Safe mode: the same action as **Stop Motors**, which also disarms the controller |
+
+While the controller is armed, it overwrites the sliders and turns on continuous send at the configured rate. The motor-output interlock still applies. Arming is refused while the right trigger or south button is held. The south button works whenever a controller is connected, armed or not. The dashboard also enters safe mode on its own if the armed controller disconnects or the dashboard tab is hidden.
 
 ### Packet monitor
 
@@ -429,6 +443,7 @@ When adding a packet type:
 ├── start-dashboard.bat       Windows launcher
 ├── src/
 │   ├── app.js                Dashboard state and UI behavior
+│   ├── gamepad.js            Game controller to command mapping
 │   ├── protocol.js           Packet schemas, CRC, encoding, and decoding
 │   └── serial-link.js        WebSocket link and streaming frame parser
 └── tests/
@@ -453,6 +468,7 @@ The tests cover:
 - fragmented input
 - CRC rejection and stream recovery
 - protocol-version rejection
+- game controller mapping, deadzones, and differential
 
 ## Linux serial permissions
 
