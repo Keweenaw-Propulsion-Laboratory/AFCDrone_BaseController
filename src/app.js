@@ -1380,8 +1380,16 @@ async function sendFrame(type, payload, decoded = null, label = null) {
   return frame;
 }
 
+// The motor sliders are in percent so the operator thinks in throttle, but the
+// command payload carries the raw uint8 the flight loop expects.
+const MOTOR_COMMAND_MAX = 255;
+
+function motorPercentToCommand(percent) {
+  const clamped = Math.min(100, Math.max(0, Number(percent) || 0));
+  return Math.round((clamped / 100) * MOTOR_COMMAND_MAX);
+}
+
 function commandValuesFromForm(forceMotorsOff = false) {
-  const motorsEnabled = $('#motor-enable').checked && !forceMotorsOff;
   return {
     flags: {
       targSlot: Number($('input[name="target-slot"]:checked').value) === 1,
@@ -1389,8 +1397,8 @@ function commandValuesFromForm(forceMotorsOff = false) {
     },
     gimbalPitch: Number($('#gimbal-pitch').value),
     gimbalYaw: Number($('#gimbal-yaw').value),
-    motorTopSpeed: motorsEnabled ? Number($('#motor-top').value) : 0,
-    motorBottomSpeed: motorsEnabled ? Number($('#motor-bottom').value) : 0,
+    motorTopSpeed: forceMotorsOff ? 0 : motorPercentToCommand($('#motor-top').value),
+    motorBottomSpeed: forceMotorsOff ? 0 : motorPercentToCommand($('#motor-bottom').value),
     unused: 0,
   };
 }
@@ -1430,7 +1438,6 @@ function updateLiveSend() {
 
 async function emergencyStop() {
   $('#live-send').checked = false;
-  $('#motor-enable').checked = false;
   $('#motor-top').value = '0';
   $('#motor-top-number').value = '0';
   $('#motor-bottom').value = '0';

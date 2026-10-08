@@ -12,7 +12,7 @@ The drone connects by USB serial to the computer running the dashboard server. T
 - Hover readouts with exact values and browser receive timestamps
 - Satellite position map using telemetry latitude and longitude
 - Target-slot, gimbal, and motor command controls
-- Motor-output safety interlock and emergency stop action
+- Emergency stop action
 - Optional continuous command transmission from 1 to 50 Hz
 - CRC-validated framed packet parser with automatic resynchronization
 - RX/TX packet monitor with raw frame, payload, and decoded-field views
@@ -225,10 +225,10 @@ The command panel sends type `4` command packets containing:
 - active slot
 - gimbal pitch
 - gimbal yaw
-- top motor speed
-- bottom motor speed
+- top motor speed (percent, scaled to 0 to 255 on the wire)
+- bottom motor speed (percent, scaled to 0 to 255 on the wire)
 
-Nonzero motor output is blocked until the motor-output interlock is enabled. The **Stop Motors** action immediately sets both motor commands to zero and transmits a command frame.
+The motor sliders are entered in percent (0 to 100) and are scaled to the 0 to 255 wire value when the command is encoded. Motor output is gated by the drone's own state, so the dashboard no longer carries a separate output interlock. The **Stop Motors** action immediately sets both motor commands to zero and transmits a command frame.
 
 Continuous transmission can be enabled at a configurable rate from 1 to 50 Hz.
 
