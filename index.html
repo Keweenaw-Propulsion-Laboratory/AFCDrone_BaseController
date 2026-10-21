@@ -63,6 +63,11 @@
           <select id="mode-request" aria-labelledby="header-mode-label" disabled></select>
           <span id="header-mode-detail" class="vehicle-chip-detail">No telemetry</span>
         </div>
+        <div id="header-log" class="vehicle-chip" title="No logger status">
+          <span class="vehicle-chip-label">SD log</span>
+          <strong id="header-log-state">--</strong>
+          <span id="header-log-detail" class="vehicle-chip-detail">No status</span>
+        </div>
       </div>
     </header>
 
@@ -193,6 +198,52 @@
             </div>
           </article>
         </div>
+
+        <article class="panel log-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>SD card log</h2>
+              <p id="log-subtitle">Flight data recorded to the drone's SD card</p>
+            </div>
+            <div class="toolbar-actions">
+              <span id="log-command-status" class="subtle"></span>
+              <label class="compact-field log-mark-field">
+                <span class="visually-hidden">Mark label</span>
+                <input id="log-mark-label" type="text" maxlength="48" placeholder="Mark label (optional)" autocomplete="off" disabled>
+              </label>
+              <button id="log-mark" class="secondary" type="button" disabled>Mark</button>
+              <button id="log-start" class="secondary" type="button" disabled>Start Log</button>
+              <button id="log-stop" class="secondary" type="button" disabled>Stop Log</button>
+            </div>
+          </div>
+          <div class="metric-grid">
+            <article id="log-state-card" class="metric-card">
+              <span class="metric-label">Logger</span>
+              <strong id="log-state">--</strong>
+              <small id="log-state-detail">No status received</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Current file</span>
+              <strong id="log-file-size">--</strong>
+              <small id="log-file-name">--</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Free space</span>
+              <strong id="log-free">--</strong>
+              <small id="log-capacity">--</small>
+            </article>
+            <article id="log-remaining-card" class="metric-card">
+              <span class="metric-label">Log time remaining</span>
+              <strong id="log-remaining">--</strong>
+              <small id="log-rate">--</small>
+            </article>
+            <article id="log-health-card" class="metric-card">
+              <span class="metric-label">Recorder health</span>
+              <strong id="log-dropped">--</strong>
+              <small id="log-health-detail">--</small>
+            </article>
+          </div>
+        </article>
 
         <article class="panel map-panel">
           <div class="panel-heading map-heading">

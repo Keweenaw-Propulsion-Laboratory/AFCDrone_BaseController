@@ -35,13 +35,25 @@ import {
   BATTERY_CRITICAL_PERCENT,
   batteryPercent,
   formatVoltage,
+  LOG_STATES,
+  LOG_ACTIONS,
+  LOG_MARK_LABEL_MAX,
+  RADIO_LOG_MARK_LABEL_MAX,
+  LOG_RESULTS,
+  LOG_RESULT_LABELS,
+  formatLogState,
+  formatLogFileName,
+  formatBytes,
+  formatDuration,
 } from './protocol.js';
 import { SerialLink } from './serial-link.js';
 import {
   encodeRadioCommandEnvelope,
   encodeRadioHeartbeatEnvelope,
   encodeRadioConfigEnvelope,
+  encodeRadioLogControlEnvelope,
   applyRadioStatusToTelemetry,
+  applyRadioLogStatus,
   sendRadioConfigSequence,
   RADIO_CONFIG_REQUEST_TIMEOUT_MS,
   RADIO_CONFIG_MAX_ATTEMPTS,
@@ -91,6 +103,8 @@ const state = {
   linkMode: null,
   linkModeKnown: false,
   relayTelemetry: {},
+  // LOG_STATUS0-2 from the radio, folded into the USB LOG_STATUS shape.
+  relayLogStatus: {},
   pendingIdentifyResolve: null,
   pendingRadioConfigResolve: null,
   // The Drone::States asserted in every heartbeat. The firmware acts on this
@@ -112,6 +126,16 @@ const state = {
   // Set once telemetry has gone stale and the request has been released to
   // SAFE, so the release happens once per outage rather than every tick.
   linkLossReleased: false,
+  // The latest LOG_STATUS from the drone's SD logger, and when it arrived.
+  lastLogStatus: null,
+  lastLogStatusAt: null,
+  // A Start/Stop Log request waiting for the LOG_STATUS that answers it,
+  // recognised by a commandCount different from the one seen at send time.
+  pendingLogCommand: null,
+  // Last seen flags.cardRemoved, so the alert fires once when the card is pulled.
+  lastLogCardRemoved: false,
+  // Demo-only: the simulated SD logger, which answers the Start/Stop buttons.
+  demoLog: null,
   // Demo-only: the state the simulated vehicle is actually in.
   demoMode: DRONE_STATES.BOOT,
   demoBootDone: false,
@@ -132,6 +156,13 @@ const configSchema = getSchemaById(USB_MESSAGE_TYPES.CONFIG);
 const heartbeatSchema = getSchemaById(USB_MESSAGE_TYPES.HEARTBEAT);
 
 const TELEMETRY_STALE_MS = 2000;
+// LOG_STATUS arrives once a second, so a few missed ones means it has stopped.
+const LOG_STATUS_STALE_MS = 3500;
+const LOG_COMMAND_TIMEOUT_MS = 3000;
+// The firmware's 1 kHz telemetry record rate fills the card at about 100 KB/s;
+// below this much recording time left the panel turns amber, then red.
+const LOG_REMAINING_WARNING_S = 30 * 60;
+const LOG_REMAINING_CRITICAL_S = 5 * 60;
 // How long an unacknowledged request waits before the chip says so rather
 // than just "requesting". Comfortably past the firmware's escalation dwell,
 // so a request that is merely waiting out the dwell doesn't look stuck.
@@ -235,6 +266,12 @@ function resetLinkMode() {
   state.pendingIdentifyResolve = null;
   state.pendingRadioConfigResolve = null;
   state.relayTelemetry = {};
+  state.relayLogStatus = {};
+  // A different link may lead to a different drone; never show the old one's log.
+  state.lastLogStatus = null;
+  state.lastLogStatusAt = null;
+  state.pendingLogCommand = null;
+  state.lastLogCardRemoved = false;
   state.autoConfigReadDone = false;
   // Release to SAFE rather than to "no request": the firmware only acts on a
   // change, so the SAFE -> flight edge a reconnecting operator needs cannot
@@ -967,6 +1004,285 @@ function updatePacketRate() {
   // Keeps the "requested" detail line honest while a request sits
   // unacknowledged, which no telemetry sample would otherwise refresh.
   if (state.pendingModeRequest !== null) renderModeStatus();
+  checkLogCommandTimeout();
+  renderLogPanel();
+}
+
+// MARK: SD log
+
+function logStatusFresh() {
+  return state.lastLogStatusAt !== null && performance.now() - state.lastLogStatusAt <= LOG_STATUS_STALE_MS;
+}
+
+function updateLogStatus(decoded) {
+  state.lastLogStatus = decoded;
+  state.lastLogStatusAt = performance.now();
+
+  const cardRemoved = Boolean(decoded.flags?.cardRemoved);
+  if (cardRemoved && !state.lastLogCardRemoved) {
+    const buffering = decoded.state === LOG_STATES.CARD_OUT;
+    showToast(buffering
+      ? 'SD card removed from the drone - buffering in RAM. Reinsert it on the ground to continue the log.'
+      : 'SD card removed from the drone. Reinsert it on the ground to log again.', 'error');
+    appendTerminal(buffering
+      ? 'SD card REMOVED: buffering in RAM (about 2.5 s) until a card is reinserted'
+      : 'SD card REMOVED', 'system');
+  } else if (!cardRemoved && state.lastLogCardRemoved && decoded.state !== LOG_STATES.NO_CARD) {
+    appendTerminal(`SD card back: log continues in ${formatLogFileName(decoded.fileIndex)}`, 'system');
+  }
+  state.lastLogCardRemoved = cardRemoved;
+
+  const pending = state.pendingLogCommand;
+  // Over the radio, commandCount arrives in LOG_STATUS2 only; until the first
+  // one it is undefined, which must not read as "changed".
+  if (pending && Number.isInteger(decoded.commandCount) && decoded.commandCount !== pending.commandCount) {
+    state.pendingLogCommand = null;
+    const verb = LOG_ACTION_VERBS[pending.action] ?? 'Command';
+    const label = LOG_RESULT_LABELS[decoded.commandResult] ?? `Result ${decoded.commandResult}`;
+    if (decoded.commandResult === LOG_RESULTS.OK && pending.action === LOG_ACTIONS.MARK) {
+      const text = pending.label ? `Mark ${decoded.marks ?? ''} "${pending.label}"` : `Mark ${decoded.marks ?? ''}`;
+      setText('log-command-status', `${text.replace(/\s+/g, ' ')} written at ${new Date().toLocaleTimeString()}`);
+      appendTerminal(`SD log: ${text} written`, 'system');
+      const input = $('#log-mark-label');
+      if (input.value === pending.label) input.value = '';
+    } else if (decoded.commandResult === LOG_RESULTS.OK) {
+      setText('log-command-status', `${verb} accepted at ${new Date().toLocaleTimeString()}`);
+      appendTerminal(`SD log ${verb.toLowerCase()} accepted`, 'system');
+    } else {
+      setText('log-command-status', `${verb} refused: ${label}`);
+      showToast(`Log ${verb.toLowerCase()} refused: ${label}`, 'error');
+      appendTerminal(`SD log ${verb.toLowerCase()} refused: ${label}`, 'system');
+    }
+  }
+  renderLogPanel();
+}
+
+const LOG_ACTION_VERBS = {
+  [LOG_ACTIONS.START]: 'Start',
+  [LOG_ACTIONS.STOP]: 'Stop',
+  [LOG_ACTIONS.MARK]: 'Mark',
+};
+
+function checkLogCommandTimeout() {
+  const pending = state.pendingLogCommand;
+  if (!pending || performance.now() - pending.sentAt < LOG_COMMAND_TIMEOUT_MS) return;
+  state.pendingLogCommand = null;
+  setText('log-command-status', 'No response from the drone');
+  showToast('The drone did not answer the log command. Its firmware may predate SD logging.', 'error');
+}
+
+function setTone(id, tone) {
+  const element = document.getElementById(id);
+  if (element) element.dataset.tone = tone;
+}
+
+function renderLogPanel() {
+  const panel = $('.log-panel');
+  if (!panel) return;
+
+  const relay = state.linkMode === 'relay';
+  const fresh = logStatusFresh();
+  const status = state.lastLogStatus;
+  panel.classList.toggle('stale', Boolean(status) && !fresh);
+
+  if (status && !fresh) {
+    setText('log-subtitle', `No logger status for over ${LOG_STATUS_STALE_MS / 1000} s`);
+  } else if (!status && state.connected) {
+    setText('log-subtitle', 'Waiting for logger status (needs firmware with SD logging)');
+  } else if (relay) {
+    setText('log-subtitle', 'Over the radio relay - sizes to the nearest KB, time to the minute');
+  } else {
+    setText('log-subtitle', "Flight data recorded to the drone's SD card");
+  }
+
+  const armed = ARMED_DRONE_STATES.includes(state.lastReportedMode);
+  const canCommand = (state.connected || state.demoRunning) && fresh && !state.pendingLogCommand;
+  const startButton = $('#log-start');
+  const stopButton = $('#log-stop');
+  startButton.disabled = !canCommand || armed || status?.state !== LOG_STATES.IDLE;
+  stopButton.disabled = !canCommand || armed
+    || ![LOG_STATES.LOGGING, LOG_STATES.RECOVERING, LOG_STATES.CARD_OUT].includes(status?.state);
+  const armedNote = armed ? 'The drone refuses log start/stop while armed or flying.' : '';
+  startButton.title = armedNote || 'Begin a new LOGnnn.BIN file';
+  stopButton.title = armedNote || 'Flush the buffer, write the end marker and close the file';
+
+  // Marks are cheap for the drone, so unlike start/stop they work in flight.
+  const markInput = $('#log-mark-label');
+  const markButton = $('#log-mark');
+  // Marks go into the RAM buffer, so they still work while the card is out.
+  const markable = [LOG_STATES.LOGGING, LOG_STATES.RECOVERING, LOG_STATES.CARD_OUT].includes(status?.state);
+  const canMark = canCommand && markable;
+  markButton.disabled = !canMark;
+  markInput.disabled = !(state.connected || state.demoRunning) || !fresh || !markable;
+  markInput.maxLength = relay ? RADIO_LOG_MARK_LABEL_MAX : LOG_MARK_LABEL_MAX;
+  markInput.placeholder = relay ? `Mark label (${RADIO_LOG_MARK_LABEL_MAX} chars)` : 'Mark label (optional)';
+  markButton.title = 'Write a named marker into the log at this moment';
+
+  renderLogHeaderChip(status, fresh);
+
+  if (!status) {
+    setText('log-state', '--');
+    setText('log-state-detail', 'No status received');
+    for (const id of ['log-file-size', 'log-file-name', 'log-free', 'log-capacity', 'log-remaining', 'log-rate', 'log-dropped', 'log-health-detail']) {
+      setText(id, '--');
+    }
+    for (const id of ['log-state-card', 'log-remaining-card', 'log-health-card']) setTone(id, '');
+    return;
+  }
+
+  const flags = status.flags ?? {};
+  const cardOut = status.state === LOG_STATES.CARD_OUT;
+  const noCard = status.state === LOG_STATES.NO_CARD || cardOut;
+
+  setText('log-state', formatLogState(status.state));
+  let stateDetail = '';
+  let stateTone = '';
+  if (cardOut) {
+    stateDetail = status.dropped > 0
+      ? 'Buffer full, records being dropped - reinsert on the ground'
+      : 'Buffering in RAM - reinsert on the ground to continue';
+    stateTone = 'danger';
+  } else if (noCard && flags.cardRemoved) {
+    setText('log-state', 'Card removed');
+    stateDetail = 'Pulled while mounted - reinsert on the ground';
+    stateTone = 'danger';
+  } else if (noCard && flags.cardUnmountable) {
+    stateDetail = 'Card will not mount - format it exFAT';
+    stateTone = 'danger';
+  } else if (noCard) {
+    stateDetail = 'Insert a card while the drone is on the ground';
+    stateTone = 'warning';
+  } else if (status.state === LOG_STATES.RECOVERING) {
+    stateDetail = 'Card write failed; still buffering and retrying';
+    stateTone = 'danger';
+  } else if (status.state === LOG_STATES.LOGGING) {
+    stateDetail = flags.slowFilesystem ? 'Recording - FAT32 card, exFAT stalls less' : 'Recording';
+    stateTone = 'ok';
+  } else {
+    stateDetail = 'Card mounted; not recording';
+    stateTone = 'warning';
+  }
+  setText('log-state-detail', stateDetail);
+  setTone('log-state-card', stateTone);
+
+  if (flags.haveFile) {
+    setText('log-file-size', formatBytes(status.fileBytes));
+    setText('log-file-name', `${formatLogFileName(status.fileIndex)}${flags.fileOpen ? '' : ' (closed)'}`);
+  } else {
+    setText('log-file-size', '--');
+    setText('log-file-name', 'No file this session');
+  }
+
+  if (noCard) {
+    setText('log-free', '--');
+    setText('log-capacity', flags.cardRemoved ? 'Card removed' : 'No card');
+    setText('log-remaining', '--');
+    setText('log-rate', '--');
+    setTone('log-remaining-card', '');
+  } else {
+    const freeBytes = status.freeKiB * 1024;
+    const cardBytes = status.cardKiB * 1024;
+    setText('log-free', formatBytes(freeBytes));
+    const recycled = status.filesRecycled > 0
+      ? ` - ${status.filesRecycled} old log${status.filesRecycled === 1 ? '' : 's'} overwritten`
+      : '';
+    setText('log-capacity', cardBytes > 0
+      ? `${Math.min(100, Math.round((freeBytes / cardBytes) * 100))}% of ${formatBytes(cardBytes)}${recycled}`
+      : '--');
+    setText('log-remaining', formatDuration(status.secondsRemaining));
+    let rateText = 'Estimated; not recording now';
+    if (status.bytesPerSec === undefined) rateText = 'Before the oldest log is overwritten';
+    else if (status.bytesPerSec > 0) rateText = `At ${formatBytes(status.bytesPerSec)}/s, then overwrites oldest`;
+    setText('log-rate', rateText);
+    let remainingTone = 'ok';
+    if (status.secondsRemaining <= LOG_REMAINING_CRITICAL_S) remainingTone = 'danger';
+    else if (status.secondsRemaining <= LOG_REMAINING_WARNING_S) remainingTone = 'warning';
+    setTone('log-remaining-card', remainingTone);
+  }
+
+  setText('log-dropped', `${status.dropped} dropped`);
+  const marks = status.marks > 0 ? ` - ${status.marks} mark${status.marks === 1 ? '' : 's'} since boot` : '';
+  setText('log-health-detail', `${status.writeErrors} write errors - buffer peak ${status.bufferPeakPct}%${marks}`);
+  let healthTone = 'ok';
+  if (status.writeErrors > 0 || status.bufferPeakPct >= 90) healthTone = 'danger';
+  else if (status.dropped > 0 || status.bufferPeakPct >= 50) healthTone = 'warning';
+  setTone('log-health-card', noCard && !cardOut ? '' : healthTone);
+}
+
+function renderLogHeaderChip(status, fresh) {
+  const chip = $('#header-log');
+  if (!chip) return;
+  chip.classList.toggle('stale', Boolean(status) && !fresh);
+
+  if (!status) {
+    setText('header-log-state', '--');
+    setText('header-log-detail', 'No status');
+    chip.dataset.tone = '';
+    chip.title = 'No logger status received';
+    return;
+  }
+
+  const flags = status.flags ?? {};
+  let text = formatLogState(status.state);
+  let detail = '';
+  let tone = '';
+  switch (status.state) {
+    case LOG_STATES.LOGGING:
+      text = 'REC';
+      detail = `${formatDuration(status.secondsRemaining)} left`;
+      tone = 'ok';
+      break;
+    case LOG_STATES.IDLE:
+      detail = 'Not recording';
+      tone = 'warning';
+      break;
+    case LOG_STATES.RECOVERING:
+      detail = 'Card error';
+      tone = 'danger';
+      break;
+    case LOG_STATES.CARD_OUT:
+      text = 'Removed';
+      detail = 'Buffering - reinsert card';
+      tone = 'danger';
+      break;
+    default:
+      text = flags.cardRemoved ? 'Removed' : formatLogState(status.state);
+      detail = flags.cardUnmountable ? 'Format card' : flags.cardRemoved ? 'Reinsert card' : 'Insert card';
+      tone = 'danger';
+      break;
+  }
+  setText('header-log-state', text);
+  setText('header-log-detail', detail);
+  chip.dataset.tone = tone;
+  chip.title = fresh ? 'SD card flight log - details on the Dashboard tab' : `No logger status for over ${LOG_STATUS_STALE_MS / 1000} s`;
+}
+
+async function sendLogControl(action, label = '') {
+  const status = state.lastLogStatus;
+  if (!status || state.pendingLogCommand) return;
+  try {
+    const relay = state.linkMode === 'relay';
+    const values = { action, label: label.slice(0, relay ? RADIO_LOG_MARK_LABEL_MAX : LOG_MARK_LABEL_MAX) };
+    const name = `Log ${LOG_ACTION_VERBS[action]}`;
+    if (relay) {
+      await sendFrame(USB_MESSAGE_TYPES.RADIO_PACKET, encodeRadioLogControlEnvelope(values), values, `Radio ${name}`);
+    } else {
+      const schema = getSchemaById(USB_MESSAGE_TYPES.LOG_CONTROL);
+      await sendFrame(schema.id, encodePayload(schema, values), values, name);
+    }
+    state.pendingLogCommand = {
+      action,
+      label: values.label,
+      commandCount: status.commandCount,
+      sentAt: performance.now(),
+    };
+    if (state.demoRunning && !state.connected) applyDemoLogControl(action);
+    setText('log-command-status', { [LOG_ACTIONS.START]: 'Starting...', [LOG_ACTIONS.STOP]: 'Stopping...', [LOG_ACTIONS.MARK]: 'Marking...' }[action]);
+  } catch (error) {
+    showToast(error.message, 'error');
+    setText('log-command-status', error.message);
+  }
+  renderLogPanel();
 }
 
 // The drone latches TRIPPED rather than reporting the SAFE transition alone,
@@ -1232,6 +1548,7 @@ function handlePacket(packet) {
   if (!decodeError && effectiveType === USB_MESSAGE_TYPES.CONFIG) updateConfigFromResponse(decoded);
   if (!decodeError && effectiveType === USB_MESSAGE_TYPES.RADIO_PACKET) handleRadioPacket(decoded);
   if (!decodeError && effectiveType === USB_MESSAGE_TYPES.RAW) handleRawPacket(packet.payload);
+  if (!decodeError && effectiveType === USB_MESSAGE_TYPES.LOG_STATUS) updateLogStatus(decoded);
 
   addPacketRow({
     direction: 'RX',
@@ -1269,6 +1586,12 @@ function handleRadioPacket(decoded) {
   if (radioMessageType >= RADIO_MESSAGE_TYPES.STATUS0 && radioMessageType <= RADIO_MESSAGE_TYPES.STATUS6) {
     applyRadioStatusToTelemetry(state.relayTelemetry, radioMessageType, decodedMessage);
     updateTelemetry(state.relayTelemetry);
+  }
+
+  if (radioMessageType >= RADIO_MESSAGE_TYPES.LOG_STATUS0 && radioMessageType <= RADIO_MESSAGE_TYPES.LOG_STATUS2) {
+    applyRadioLogStatus(state.relayLogStatus, radioMessageType, decodedMessage);
+    // Wait for LOG_STATUS0, which carries the state everything else hangs off.
+    if (state.relayLogStatus.state !== undefined) updateLogStatus({ ...state.relayLogStatus });
   }
 
   if (radioMessageType === RADIO_MESSAGE_TYPES.CONFIG && state.pendingRadioConfigResolve) {
@@ -1949,12 +2272,23 @@ function generateDemoTelemetry() {
     latitude: 47.1164,
     longitude: -88.5385,
   };
-  const payload = encodePayload(telemetrySchema, values);
-  const raw = buildPacket(state.rxPackets & 0xffff, USB_MESSAGE_TYPES.TELEMETRY, payload);
+  injectDemoPacket(USB_MESSAGE_TYPES.TELEMETRY, encodePayload(telemetrySchema, values));
+
+  // The real drone reports its logger once a second.
+  const log = state.demoLog;
+  const now = performance.now();
+  if (log && now - log.lastReportAt >= 1000) {
+    advanceDemoLog(log, now);
+    injectDemoLogStatus();
+  }
+}
+
+function injectDemoPacket(type, payload) {
+  const raw = buildPacket(state.rxPackets & 0xffff, type, payload);
   handlePacket({
     version: PROTOCOL_VERSION,
     packetNumber: state.rxPackets & 0xffff,
-    type: USB_MESSAGE_TYPES.TELEMETRY,
+    type,
     payloadLength: payload.length,
     payload,
     crc: new DataView(raw.buffer, raw.byteOffset, raw.byteLength).getUint16(raw.byteLength - CRC_SIZE, true),
@@ -1962,6 +2296,83 @@ function generateDemoTelemetry() {
     raw,
     receivedAt: performance.now(),
   });
+}
+
+// Demo-only: a 32 GB FAT32 card recording 1 kHz telemetry records.
+const DEMO_LOG_RATE = 104_000;
+const DEMO_CARD_KIB = 31_166_976;
+
+function createDemoLog() {
+  return {
+    state: LOG_STATES.LOGGING,
+    fileOpen: true,
+    haveFile: true,
+    fileIndex: 3,
+    fileBytes: 512,
+    usedKiB: 2_400_000,
+    marks: 0,
+    commandCount: 0,
+    commandResult: LOG_RESULTS.OK,
+    lastReportAt: performance.now(),
+  };
+}
+
+function advanceDemoLog(log, now) {
+  const elapsed = (now - log.lastReportAt) / 1000;
+  log.lastReportAt = now;
+  if (log.state !== LOG_STATES.LOGGING) return;
+  const written = Math.round(DEMO_LOG_RATE * elapsed);
+  log.fileBytes += written;
+  log.usedKiB += written / 1024;
+}
+
+function applyDemoLogControl(action) {
+  const log = state.demoLog;
+  if (!log) return;
+  advanceDemoLog(log, performance.now());
+  log.commandCount = (log.commandCount + 1) & 0xff;
+
+  if (action === LOG_ACTIONS.MARK) {
+    // Like the drone, marks are accepted in flight but need an open log.
+    log.commandResult = log.state === LOG_STATES.LOGGING ? LOG_RESULTS.OK : LOG_RESULTS.WRONG_STATE;
+    if (log.commandResult === LOG_RESULTS.OK) log.marks = (log.marks + 1) & 0xff;
+  } else if (ARMED_DRONE_STATES.includes(state.demoMode)) {
+    log.commandResult = LOG_RESULTS.IN_FLIGHT;
+  } else if (action === LOG_ACTIONS.START && log.state === LOG_STATES.IDLE) {
+    Object.assign(log, { state: LOG_STATES.LOGGING, fileOpen: true, fileIndex: log.fileIndex + 1, fileBytes: 512 });
+    log.commandResult = LOG_RESULTS.OK;
+  } else if (action === LOG_ACTIONS.STOP && log.state === LOG_STATES.LOGGING) {
+    Object.assign(log, { state: LOG_STATES.IDLE, fileOpen: false });
+    log.commandResult = LOG_RESULTS.OK;
+  } else {
+    log.commandResult = LOG_RESULTS.WRONG_STATE;
+  }
+  // The firmware answers a command at once rather than at the next second.
+  window.setTimeout(injectDemoLogStatus, 150);
+}
+
+function injectDemoLogStatus() {
+  const log = state.demoLog;
+  if (!log || !state.demoRunning) return;
+  const freeKiB = Math.max(0, Math.round(DEMO_CARD_KIB - log.usedKiB));
+  const values = {
+    state: log.state,
+    flags: { fileOpen: log.fileOpen, haveFile: log.haveFile, cardUnmountable: false, slowFilesystem: true },
+    fileIndex: log.fileIndex,
+    cardKiB: DEMO_CARD_KIB,
+    freeKiB,
+    fileBytes: log.fileBytes,
+    bytesPerSec: log.state === LOG_STATES.LOGGING ? DEMO_LOG_RATE : 0,
+    secondsRemaining: Math.floor((freeKiB * 1024) / DEMO_LOG_RATE),
+    dropped: 0,
+    writeErrors: 0,
+    bufferPeakPct: 4,
+    commandCount: log.commandCount,
+    commandResult: log.commandResult,
+    filesRecycled: 0,
+    marks: log.marks,
+  };
+  injectDemoPacket(USB_MESSAGE_TYPES.LOG_STATUS, encodePayload(getSchemaById(USB_MESSAGE_TYPES.LOG_STATUS), values));
 }
 
 function toggleDemo() {
@@ -1979,6 +2390,7 @@ function toggleDemo() {
     state.demoMode = DRONE_STATES.BOOT;
     state.demoBootDone = false;
     state.demoStartedAt = performance.now();
+    state.demoLog = createDemoLog();
     updateLinkModeDisplay();
     state.demoTimer = window.setInterval(generateDemoTelemetry, 100);
     $('#demo-button').textContent = 'Stop Demo';
@@ -1987,6 +2399,7 @@ function toggleDemo() {
     appendTerminal('Demo telemetry started', 'system');
   } else {
     resetLinkMode();
+    state.demoLog = null;
     $('#demo-button').textContent = 'Demo Data';
     setConnectionStatus(false, 'Disconnected');
     appendTerminal('Demo telemetry stopped', 'system');
@@ -2062,6 +2475,12 @@ function bindEvents() {
   $('#mode-request').addEventListener('change', handleModeRequestChange);
   $('#send-command').addEventListener('click', () => sendCommand(false));
   $('#emergency-stop').addEventListener('click', emergencyStop);
+  $('#log-start').addEventListener('click', () => sendLogControl(LOG_ACTIONS.START));
+  $('#log-stop').addEventListener('click', () => sendLogControl(LOG_ACTIONS.STOP));
+  $('#log-mark').addEventListener('click', () => sendLogControl(LOG_ACTIONS.MARK, $('#log-mark-label').value.trim()));
+  $('#log-mark-label').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !$('#log-mark').disabled) $('#log-mark').click();
+  });
   $('#live-send').addEventListener('change', updateLiveSend);
   $('#live-rate').addEventListener('change', updateLiveSend);
   $('#schema-select').addEventListener('change', renderSchemaFields);
@@ -2175,6 +2594,7 @@ function initialize() {
   renderModeRequestOptions();
   renderModeStatus();
   updateWatchdogStatus(null);
+  renderLogPanel();
   renderGenericBuilder();
   renderConfigForm();
   initializeMap();

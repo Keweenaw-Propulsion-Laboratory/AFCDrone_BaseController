@@ -24,6 +24,46 @@ export function encodeRadioHeartbeatEnvelope(heartbeatValues) {
   return encodeRadioPacketEnvelope(RADIO_MESSAGE_TYPES.HEARTBEAT, message);
 }
 
+// The radio carries exactly 8 bytes, so a mark label is cut to 7 characters.
+export function encodeRadioLogControlEnvelope(values) {
+  const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_CONTROL, values);
+  return encodeRadioPacketEnvelope(RADIO_MESSAGE_TYPES.LOG_CONTROL, message);
+}
+
+/**
+ * Folds one LOG_STATUS0-2 packet into a persistent object shaped like the USB
+ * LOG_STATUS record, so the log panel renders either link the same way.
+ * Coarser radio units are scaled back up: KiB file size, whole minutes left,
+ * whole GiB of card.
+ */
+export function applyRadioLogStatus(status, radioMessageType, decodedMessage) {
+  switch (radioMessageType) {
+    case RADIO_MESSAGE_TYPES.LOG_STATUS0:
+      status.state = decodedMessage.state;
+      status.flags = decodedMessage.flags;
+      status.fileIndex = decodedMessage.fileIndex;
+      status.fileBytes = decodedMessage.fileKiB * 1024;
+      break;
+    case RADIO_MESSAGE_TYPES.LOG_STATUS1:
+      status.freeKiB = decodedMessage.freeKiB;
+      status.secondsRemaining = decodedMessage.minutesRemaining * 60;
+      status.cardKiB = decodedMessage.cardGiB * 1024 * 1024;
+      break;
+    case RADIO_MESSAGE_TYPES.LOG_STATUS2:
+      status.dropped = decodedMessage.dropped;
+      status.writeErrors = decodedMessage.writeErrors;
+      status.bufferPeakPct = decodedMessage.bufferPeakPct;
+      status.commandCount = decodedMessage.commandCount;
+      status.commandResult = decodedMessage.commandResult;
+      status.filesRecycled = decodedMessage.filesRecycled;
+      status.marks = decodedMessage.marks;
+      break;
+    default:
+      break;
+  }
+  return status;
+}
+
 export function encodeRadioConfigEnvelope(operation, key, value = 0) {
   const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, {
     version: CONFIG_VERSION,

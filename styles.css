@@ -210,6 +210,20 @@ button.full-width { width: 100%; margin-top: 16px; }
 .stats-inline [data-tone="warning"] strong { color: var(--warning); }
 .stats-inline [data-tone="danger"] strong { color: var(--danger); }
 #telemetry-watchdog { cursor: help; }
+.metric-card[data-tone="ok"] strong { color: var(--success); }
+.metric-card[data-tone="active"] strong { color: var(--accent); }
+.metric-card[data-tone="warning"] strong { color: var(--warning); }
+.metric-card[data-tone="danger"] strong { color: var(--danger); }
+.log-panel.stale .metric-grid { opacity: .5; }
+.log-mark-field input { width: 190px; }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
 .chart-heading { align-items: center; }
 .chart-heading-controls {
   display: flex;

@@ -47,7 +47,11 @@ export const USB_MESSAGE_TYPES = Object.freeze({
   TELEMETRY: 3,
   COMMAND: 4,
   CONFIG: 5,
-  // 6-9 are unused: HEARTBEAT deliberately shares the RF message number so
+  // SD card logger status and control. USB only: the radio link does not
+  // carry them, so a relay connection never sees them.
+  LOG_STATUS: 6,
+  LOG_CONTROL: 7,
+  // 8-9 are unused: HEARTBEAT deliberately shares the RF message number so
   // the same 8 bytes carry the same type id on both links (AFC-Drone
   // include/usb.h - "Same as Radio").
   HEARTBEAT: 10,
@@ -67,6 +71,11 @@ export const RADIO_MESSAGE_TYPES = Object.freeze({
   COMMAND: 8,
   CONFIG: 9,
   HEARTBEAT: 10,
+  // SD logger status, split over three 8-byte packets, and its control.
+  LOG_STATUS0: 11,
+  LOG_STATUS1: 12,
+  LOG_STATUS2: 13,
+  LOG_CONTROL: 14,
 });
 
 export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
@@ -81,6 +90,10 @@ export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
   [RADIO_MESSAGE_TYPES.COMMAND]: 'Command',
   [RADIO_MESSAGE_TYPES.CONFIG]: 'Config',
   [RADIO_MESSAGE_TYPES.HEARTBEAT]: 'Heartbeat',
+  [RADIO_MESSAGE_TYPES.LOG_STATUS0]: 'Log Status0',
+  [RADIO_MESSAGE_TYPES.LOG_STATUS1]: 'Log Status1',
+  [RADIO_MESSAGE_TYPES.LOG_STATUS2]: 'Log Status2',
+  [RADIO_MESSAGE_TYPES.LOG_CONTROL]: 'Log Control',
 });
 
 // The connection-identify handshake reuses USB_MESSAGE_TYPES.RAW, which no
@@ -225,6 +238,109 @@ export function batteryPercent(millivolts) {
 export function formatVoltage(millivolts) {
   if (!Number.isFinite(millivolts) || millivolts <= 0) return '--';
   return `${(millivolts / 1000).toFixed(2)} V`;
+}
+
+// SD logger, from AFC-Drone include/logger.h (Logger::State, Logger::Result)
+// and src/usb.cpp (LogStatus, LogControl).
+export const LOG_STATUS_PAYLOAD_SIZE = 36;
+// LOG_CONTROL is at least 8 bytes - the radio's fixed size - and over USB may
+// run longer to carry a full mark label.
+export const LOG_CONTROL_PAYLOAD_SIZE = 8;
+export const LOG_MARK_LABEL_MAX = 48;
+export const RADIO_LOG_MARK_LABEL_MAX = LOG_CONTROL_PAYLOAD_SIZE - 1;
+
+export const LOG_STATES = Object.freeze({
+  NO_CARD: 0,
+  IDLE: 1,
+  LOGGING: 2,
+  // A card write failed; the drone keeps buffering while it retries.
+  RECOVERING: 3,
+  // The card was pulled mid-log. The drone keeps buffering in RAM (about
+  // 2.5 s worth) and continues the same log when a card is reinserted on the
+  // ground.
+  CARD_OUT: 4,
+});
+
+export const LOG_STATE_NAMES = Object.freeze({
+  [LOG_STATES.NO_CARD]: 'No card',
+  [LOG_STATES.IDLE]: 'Stopped',
+  [LOG_STATES.LOGGING]: 'Logging',
+  [LOG_STATES.RECOVERING]: 'Recovering',
+  [LOG_STATES.CARD_OUT]: 'Card removed',
+});
+
+export const LOG_ACTIONS = Object.freeze({
+  START: 1,
+  STOP: 2,
+  // Writes "MARK n: label" into the log. Accepted in flight.
+  MARK: 3,
+});
+
+export const LOG_RESULTS = Object.freeze({
+  OK: 0,
+  IN_FLIGHT: 1,
+  NO_CARD: 2,
+  WRONG_STATE: 3,
+  CARD_ERROR: 4,
+  UNKNOWN_ACTION: 5,
+});
+
+export const LOG_RESULT_LABELS = Object.freeze({
+  [LOG_RESULTS.OK]: 'OK',
+  [LOG_RESULTS.IN_FLIGHT]: 'Refused while armed or flying',
+  [LOG_RESULTS.NO_CARD]: 'No SD card',
+  [LOG_RESULTS.WRONG_STATE]: 'Already in that state',
+  [LOG_RESULTS.CARD_ERROR]: 'SD card error',
+  [LOG_RESULTS.UNKNOWN_ACTION]: 'Not supported by this firmware',
+});
+
+// One shared descriptor so USB LOG_STATUS and radio LOG_STATUS0 decode the
+// flags byte identically.
+function logFlagsField() {
+  return {
+    key: 'flags',
+    label: 'Flags',
+    type: 'bitfield8',
+    bits: [
+      { key: 'fileOpen', label: 'File open', bit: 0, default: false },
+      { key: 'haveFile', label: 'Has file', bit: 1, default: false },
+      { key: 'cardUnmountable', label: 'Card needs formatting', bit: 2, default: false },
+      { key: 'slowFilesystem', label: 'Not exFAT', bit: 3, default: false },
+      // Latched from the moment a mounted card is pulled until a card mounts again.
+      { key: 'cardRemoved', label: 'Card removed', bit: 4, default: false },
+    ],
+  };
+}
+
+export function formatLogState(value) {
+  if (value === undefined || value === null) return '--';
+  return LOG_STATE_NAMES[value] ?? `Unknown (${value})`;
+}
+
+export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '--';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 || value >= 100 ? 0 : 1)} ${units[unit]}`;
+}
+
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '--';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) return `${hours} h ${String(minutes).padStart(2, '0')} min`;
+  if (minutes > 0) return `${minutes} min`;
+  return `${Math.floor(seconds)} s`;
+}
+
+export function formatLogFileName(index) {
+  if (!Number.isInteger(index)) return '--';
+  return `LOG${String(index).padStart(3, '0')}.BIN`;
 }
 
 // The persistent-config wire version, versioned independently of the USB
@@ -455,7 +571,66 @@ const RADIO_CONFIG_SCHEMA = {
   ],
 };
 
+// Action byte, then an ASCII mark label padded with NULs to at least 8 bytes.
+export function encodeLogControlPayload(values = {}, maxLabel = LOG_MARK_LABEL_MAX) {
+  const action = Number(values.action ?? LOG_ACTIONS.STOP);
+  const label = action === LOG_ACTIONS.MARK
+    ? new TextEncoder().encode(String(values.label ?? '').replace(/[^\x20-\x7e]/g, '?')).slice(0, maxLabel)
+    : new Uint8Array(0);
+  const payload = new Uint8Array(Math.max(LOG_CONTROL_PAYLOAD_SIZE, 1 + label.length));
+  payload[0] = action & 0xff;
+  payload.set(label, 1);
+  return payload;
+}
+
+function decodeLogControlPayload(payload) {
+  if (payload.byteLength < LOG_CONTROL_PAYLOAD_SIZE || payload.byteLength > 1 + LOG_MARK_LABEL_MAX) {
+    throw new Error(`Log Control requires ${LOG_CONTROL_PAYLOAD_SIZE}-${1 + LOG_MARK_LABEL_MAX} bytes, received ${payload.byteLength}`);
+  }
+  const label = new TextDecoder().decode(payload.slice(1)).replace(/\0[\s\S]*$/, '');
+  return { action: payload[0], label };
+}
+
+// AFC-Drone include/radio.h LogStatusMsg0_t..2_t: the USB LOG_STATUS record
+// in coarser units. radio-relay.js folds them back into the USB shape.
+const RADIO_LOG_STATUS_SCHEMAS = {
+  [RADIO_MESSAGE_TYPES.LOG_STATUS0]: {
+    name: 'Log Status0', payloadSize: 8,
+    fields: [
+      { key: 'state', type: 'uint8' },
+      logFlagsField(),
+      { key: 'fileIndex', type: 'uint16' },
+      { key: 'fileKiB', type: 'uint32' },
+    ],
+  },
+  [RADIO_MESSAGE_TYPES.LOG_STATUS1]: {
+    name: 'Log Status1', payloadSize: 8,
+    fields: [
+      { key: 'freeKiB', type: 'uint32' },
+      { key: 'minutesRemaining', type: 'uint16' },
+      { key: 'cardGiB', type: 'uint16' },
+    ],
+  },
+  [RADIO_MESSAGE_TYPES.LOG_STATUS2]: {
+    name: 'Log Status2', payloadSize: 8,
+    fields: [
+      { key: 'dropped', type: 'uint16' },
+      { key: 'writeErrors', type: 'uint8' },
+      { key: 'bufferPeakPct', type: 'uint8' },
+      { key: 'commandCount', type: 'uint8' },
+      { key: 'commandResult', type: 'uint8' },
+      { key: 'filesRecycled', type: 'uint8' },
+      { key: 'marks', type: 'uint8' },
+    ],
+  },
+};
+
 export function decodeRadioMessage(radioMessageType, bytes) {
+  if (radioMessageType === RADIO_MESSAGE_TYPES.LOG_CONTROL) {
+    return decodeLogControlPayload(bytes);
+  }
+  const logSchema = RADIO_LOG_STATUS_SCHEMAS[radioMessageType];
+  if (logSchema) return decodePayload(logSchema, bytes);
   if (radioMessageType === RADIO_MESSAGE_TYPES.COMMAND) {
     return decodePayload(getSchemaById(USB_MESSAGE_TYPES.COMMAND), bytes);
   }
@@ -474,6 +649,12 @@ export function decodeRadioMessage(radioMessageType, bytes) {
 }
 
 export function encodeRadioMessage(radioMessageType, values) {
+  if (radioMessageType === RADIO_MESSAGE_TYPES.LOG_CONTROL) {
+    // Exactly 8 bytes on the radio, which leaves room for 7 label characters.
+    return encodeLogControlPayload(values, RADIO_LOG_MARK_LABEL_MAX);
+  }
+  const logSchema = RADIO_LOG_STATUS_SCHEMAS[radioMessageType];
+  if (logSchema) return encodePayload(logSchema, values);
   if (radioMessageType === RADIO_MESSAGE_TYPES.COMMAND) {
     return encodePayload(getSchemaById(USB_MESSAGE_TYPES.COMMAND), values);
   }
@@ -633,6 +814,39 @@ export const PACKET_SCHEMAS = [
     builderHidden: true,
     encoder: encodeConfigPayload,
     decoder: decodeConfigPayload,
+  },
+  {
+    id: USB_MESSAGE_TYPES.LOG_STATUS,
+    name: 'Log Status',
+    direction: 'in',
+    payloadSize: LOG_STATUS_PAYLOAD_SIZE,
+    fields: [
+      { key: 'state', label: 'Logger state', type: 'uint8' },
+      logFlagsField(),
+      { key: 'fileIndex', label: 'File number', type: 'uint16' },
+      { key: 'cardKiB', label: 'Card size', type: 'uint32', unit: 'KiB' },
+      { key: 'freeKiB', label: 'Free space', type: 'uint32', unit: 'KiB' },
+      { key: 'fileBytes', label: 'File size', type: 'uint32', unit: 'B' },
+      { key: 'bytesPerSec', label: 'Data rate', type: 'uint32', unit: 'B/s' },
+      { key: 'secondsRemaining', label: 'Time remaining', type: 'uint32', unit: 's' },
+      { key: 'dropped', label: 'Dropped records', type: 'uint32' },
+      { key: 'writeErrors', label: 'Write errors', type: 'uint16' },
+      { key: 'bufferPeakPct', label: 'Buffer peak', type: 'uint8', unit: '%' },
+      { key: 'commandCount', label: 'Command count', type: 'uint8' },
+      { key: 'commandResult', label: 'Last command result', type: 'uint8' },
+      { key: 'filesRecycled', label: 'Old logs overwritten', type: 'uint16' },
+      { key: 'marks', label: 'Marks', type: 'uint8' },
+    ],
+  },
+  {
+    id: USB_MESSAGE_TYPES.LOG_CONTROL,
+    name: 'Log Control',
+    direction: 'out',
+    variableLength: true,
+    // Sent by the SD logging panel's Start/Stop/Mark controls.
+    builderHidden: true,
+    encoder: (values) => encodeLogControlPayload(values, LOG_MARK_LABEL_MAX),
+    decoder: decodeLogControlPayload,
   },
   {
     id: USB_MESSAGE_TYPES.HEARTBEAT,

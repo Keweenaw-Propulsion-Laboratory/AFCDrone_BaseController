@@ -13,6 +13,8 @@ The drone connects by USB serial to the computer running the dashboard server. T
 - Satellite position map using telemetry latitude and longitude
 - Target-slot, gimbal, and motor command controls
 - Emergency stop action
+- SD card log panel: recorder state, current file size, free space, time left before the oldest log is overwritten, Start/Stop Log, and named marks dropped into the log during flight - over USB or the radio relay (relay mark labels are limited to 7 characters)
+- SD log chip in the header showing REC / Stopped / card problems at a glance
 - Optional continuous command transmission from 1 to 50 Hz
 - CRC-validated framed packet parser with automatic resynchronization
 - RX/TX packet monitor with raw frame, payload, and decoded-field views

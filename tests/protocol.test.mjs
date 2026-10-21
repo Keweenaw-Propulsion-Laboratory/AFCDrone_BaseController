@@ -44,13 +44,25 @@ import {
   WATCHDOG_BITS,
   batteryPercent,
   formatVoltage,
+  LOG_STATUS_PAYLOAD_SIZE,
+  LOG_CONTROL_PAYLOAD_SIZE,
+  LOG_STATES,
+  LOG_ACTIONS,
+  LOG_RESULTS,
+  formatBytes,
+  formatDuration,
+  formatLogFileName,
+  LOG_MARK_LABEL_MAX,
+  RADIO_LOG_MARK_LABEL_MAX,
 } from '../src/protocol.js';
 import {
   encodeRadioPacketEnvelope,
   encodeRadioCommandEnvelope,
   encodeRadioHeartbeatEnvelope,
   encodeRadioConfigEnvelope,
+  encodeRadioLogControlEnvelope,
   applyRadioStatusToTelemetry,
+  applyRadioLogStatus,
   sendRadioConfigSequence,
 } from '../src/radio-relay.js';
 import { PacketStreamParser } from '../src/serial-link.js';
@@ -704,5 +716,133 @@ assert.equal(batteryPercent(12000), 0);
 assert.equal(batteryPercent(16500), 100);
 assert.equal(batteryPercent(16800), 100);
 assert.ok(Math.abs(batteryPercent(14795) - 50) < 1e-9);
+
+// LOG_STATUS mirrors AFC-Drone src/usb.cpp's packed LogStatus, byte for byte.
+{
+  const payload = new Uint8Array(LOG_STATUS_PAYLOAD_SIZE);
+  const view = new DataView(payload.buffer);
+  view.setUint8(0, LOG_STATES.LOGGING);
+  view.setUint8(1, 0b1011); // FILE_OPEN | HAVE_FILE | SLOW_FILESYSTEM
+  view.setUint16(2, 7, true);
+  view.setUint32(4, 31_166_976, true);
+  view.setUint32(8, 30_000_000, true);
+  view.setUint32(12, 5_120_512, true);
+  view.setUint32(16, 104_000, true);
+  view.setUint32(20, 295_384, true);
+  view.setUint32(24, 3, true);
+  view.setUint16(28, 1, true);
+  view.setUint8(30, 12);
+  view.setUint8(31, 9);
+  view.setUint8(32, LOG_RESULTS.IN_FLIGHT);
+  view.setUint16(33, 2, true);
+  view.setUint8(35, 5);
+
+  const decoded = decodePayload(getSchemaById(USB_MESSAGE_TYPES.LOG_STATUS), payload);
+  assert.equal(decoded.state, LOG_STATES.LOGGING);
+  assert.equal(decoded.flags.fileOpen, true);
+  assert.equal(decoded.flags.haveFile, true);
+  assert.equal(decoded.flags.cardUnmountable, false);
+  assert.equal(decoded.flags.slowFilesystem, true);
+  assert.equal(decoded.flags.cardRemoved, false);
+  assert.equal(decoded.fileIndex, 7);
+  assert.equal(decoded.cardKiB, 31_166_976);
+  assert.equal(decoded.freeKiB, 30_000_000);
+  assert.equal(decoded.fileBytes, 5_120_512);
+  assert.equal(decoded.bytesPerSec, 104_000);
+  assert.equal(decoded.secondsRemaining, 295_384);
+  assert.equal(decoded.dropped, 3);
+  assert.equal(decoded.writeErrors, 1);
+  assert.equal(decoded.bufferPeakPct, 12);
+  assert.equal(decoded.commandCount, 9);
+  assert.equal(decoded.commandResult, LOG_RESULTS.IN_FLIGHT);
+  assert.equal(decoded.filesRecycled, 2);
+  assert.equal(decoded.marks, 5);
+  assert.throws(() => decodePayload(getSchemaById(USB_MESSAGE_TYPES.LOG_STATUS), new Uint8Array(32)));
+}
+
+{
+  const schema = getSchemaById(USB_MESSAGE_TYPES.LOG_CONTROL);
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.START })), [1, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.STOP })), [2, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(encodePayload(schema, { action: LOG_ACTIONS.STOP }).byteLength, LOG_CONTROL_PAYLOAD_SIZE);
+  assert.ok(!getOutboundSchemas().includes(schema), 'LOG_CONTROL is sent by the log panel, not the builder');
+
+  // MARK carries its label after the action byte; USB grows past 8 bytes for it.
+  const mark = encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'gust here' });
+  assert.deepEqual(Array.from(mark), [3, ...new TextEncoder().encode('gust here')]);
+  assert.deepEqual(decodePayload(schema, mark), { action: LOG_ACTIONS.MARK, label: 'gust here' });
+  const shortMark = encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'a' });
+  assert.equal(shortMark.byteLength, LOG_CONTROL_PAYLOAD_SIZE);
+  assert.deepEqual(decodePayload(schema, shortMark), { action: LOG_ACTIONS.MARK, label: 'a' });
+  assert.equal(encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'x'.repeat(80) }).byteLength, 1 + LOG_MARK_LABEL_MAX);
+  // Start/stop ignore any label.
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.START, label: 'ignored' })), [1, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+// Radio LOG_CONTROL is exactly 8 bytes, so a mark label is cut to 7 characters.
+{
+  const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_CONTROL, { action: LOG_ACTIONS.MARK, label: 'oscillation' });
+  assert.equal(message.byteLength, 8);
+  assert.deepEqual(decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_CONTROL, message), { action: LOG_ACTIONS.MARK, label: 'oscilla' });
+  assert.equal(RADIO_LOG_MARK_LABEL_MAX, 7);
+  const envelope = encodeRadioLogControlEnvelope({ action: LOG_ACTIONS.STOP });
+  assert.equal(envelope[2], RADIO_MESSAGE_TYPES.LOG_CONTROL);
+  assert.deepEqual(Array.from(envelope.slice(3)), [2, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+// Radio LOG_STATUS0-2 mirror AFC-Drone include/radio.h and fold into the USB shape.
+{
+  const status0 = new Uint8Array(8);
+  const v0 = new DataView(status0.buffer);
+  v0.setUint8(0, LOG_STATES.LOGGING);
+  v0.setUint8(1, 0b0011);
+  v0.setUint16(2, 12, true);
+  v0.setUint32(4, 5000, true);
+
+  const status1 = new Uint8Array(8);
+  const v1 = new DataView(status1.buffer);
+  v1.setUint32(0, 30_000_000, true);
+  v1.setUint16(4, 4923, true);
+  v1.setUint16(6, 29, true);
+
+  const status2 = new Uint8Array([7, 0, 1, 12, 9, LOG_RESULTS.OK, 3, 4]);
+
+  const folded = {};
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS0, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS0, status0));
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS1, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS1, status1));
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS2, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS2, status2));
+  assert.equal(folded.state, LOG_STATES.LOGGING);
+  assert.equal(folded.flags.fileOpen, true);
+  assert.equal(folded.flags.haveFile, true);
+  {
+    const removed = new Uint8Array(8);
+    removed[0] = LOG_STATES.NO_CARD;
+    removed[1] = 0b10010; // HAVE_FILE | CARD_REMOVED
+    const flags = decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS0, removed).flags;
+    assert.equal(flags.cardRemoved, true);
+    assert.equal(flags.fileOpen, false);
+  }
+  assert.equal(folded.fileIndex, 12);
+  assert.equal(folded.fileBytes, 5000 * 1024);
+  assert.equal(folded.freeKiB, 30_000_000);
+  assert.equal(folded.secondsRemaining, 4923 * 60);
+  assert.equal(folded.cardKiB, 29 * 1024 * 1024);
+  assert.equal(folded.dropped, 7);
+  assert.equal(folded.writeErrors, 1);
+  assert.equal(folded.bufferPeakPct, 12);
+  assert.equal(folded.commandCount, 9);
+  assert.equal(folded.commandResult, LOG_RESULTS.OK);
+  assert.equal(folded.filesRecycled, 3);
+  assert.equal(folded.marks, 4);
+  assert.equal(RADIO_MESSAGE_TYPE_NAMES[RADIO_MESSAGE_TYPES.LOG_STATUS1], 'Log Status1');
+}
+
+assert.equal(formatBytes(512), '512 B');
+assert.equal(formatBytes(5_120_512), '4.9 MB');
+assert.equal(formatBytes(30_000_000 * 1024), '28.6 GB');
+assert.equal(formatDuration(295_384), '82 h 03 min');
+assert.equal(formatDuration(125), '2 min');
+assert.equal(formatDuration(42), '42 s');
+assert.equal(formatLogFileName(7), 'LOG007.BIN');
 
 console.log('Protocol framing and payload decoder tests passed');
