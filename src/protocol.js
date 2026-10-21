@@ -255,9 +255,9 @@ export const LOG_STATES = Object.freeze({
   LOGGING: 2,
   // A card write failed; the drone keeps buffering while it retries.
   RECOVERING: 3,
-  // The card was pulled mid-log. The drone keeps buffering in RAM (about
-  // 2.5 s worth) and continues the same log when a card is reinserted on the
-  // ground.
+  // The card lost contact mid-log. The drone keeps buffering in RAM (about
+  // 2.5 s worth) and continues the same log as soon as the card is back - in
+  // flight too, for the same card.
   CARD_OUT: 4,
 });
 

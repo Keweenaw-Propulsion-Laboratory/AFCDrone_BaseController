@@ -1022,10 +1022,10 @@ function updateLogStatus(decoded) {
   if (cardRemoved && !state.lastLogCardRemoved) {
     const buffering = decoded.state === LOG_STATES.CARD_OUT;
     showToast(buffering
-      ? 'SD card removed from the drone - buffering in RAM. Reinsert it on the ground to continue the log.'
+      ? 'SD card lost contact - buffering in RAM. The log continues as soon as the card is back, in flight too.'
       : 'SD card removed from the drone. Reinsert it on the ground to log again.', 'error');
     appendTerminal(buffering
-      ? 'SD card REMOVED: buffering in RAM (about 2.5 s) until a card is reinserted'
+      ? 'SD card LOST: buffering in RAM (about 2.5 s) until the card is back'
       : 'SD card REMOVED', 'system');
   } else if (!cardRemoved && state.lastLogCardRemoved && decoded.state !== LOG_STATES.NO_CARD) {
     appendTerminal(`SD card back: log continues in ${formatLogFileName(decoded.fileIndex)}`, 'system');
@@ -1139,8 +1139,8 @@ function renderLogPanel() {
   let stateTone = '';
   if (cardOut) {
     stateDetail = status.dropped > 0
-      ? 'Buffer full, records being dropped - reinsert on the ground'
-      : 'Buffering in RAM - reinsert on the ground to continue';
+      ? 'Buffer full, records being dropped until the card is back'
+      : 'Buffering in RAM - continues as soon as the card is back';
     stateTone = 'danger';
   } else if (noCard && flags.cardRemoved) {
     setText('log-state', 'Card removed');
