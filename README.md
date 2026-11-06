@@ -12,7 +12,11 @@ The drone connects by USB serial to the computer running the dashboard server. T
 - Hover readouts with exact values and browser receive timestamps
 - Satellite position map using telemetry latitude and longitude
 - Target-slot, gimbal, and motor command controls
-- Emergency stop action
+- Emergency stop action, available to every connected client
+- Multi-client operation: one controller flies, any number of viewers watch telemetry, use config and SD logging, and can stop the vehicle
+- Smooth pilot handoff that keeps the current flight mode and never starves the watchdog
+- Flight-mode control with watchdog status, battery status, and out-of-focus alerts
+- Config values cached on the server and shared with every open dashboard
 - SD card log panel: recorder state, current file size, free space, time left before the oldest log is overwritten, Start/Stop Log, and named marks dropped into the log during flight - over USB or the radio relay (relay mark labels are limited to 7 characters)
 - SD log chip in the header showing REC / Stopped / card problems at a glance
 - Optional continuous command transmission from 1 to 50 Hz
@@ -42,7 +46,7 @@ The drone connects by USB serial to the computer running the dashboard server. T
                                          └───────────────────────────┘
 ```
 
-The server maintains one physical serial connection. Multiple browser clients may view the same incoming data. Commands sent by any connected browser are forwarded to the drone.
+The server maintains one physical serial connection and one shared packet counter. Any number of browsers may connect. Exactly one is the **controller** and may fly the vehicle; the rest are **viewers**. See [Multiple clients](#multiple-clients).
 
 ## Requirements
 
@@ -150,7 +154,7 @@ python server.py
 The header shows battery voltage and flight mode on every tab. On screens wider than 820 px it also stays pinned to the top of the page while you scroll.
 
 - **Battery** shows the telemetry `voltage` in volts and as a percentage. The percentage is linear across 13.09–16.5 V (4S LiPo). It turns amber at or below 40% and red at or below 20%. A reading of `0` means the drone is not reporting voltage yet, and the header shows `--`.
-- **Flight mode** is one control rather than two. The selector shows the drone's reported `Drone::States` and follows it whenever the drone changes state on its own. Requesting a mode switches the selector to the requested state and highlights it until telemetry confirms the change, so the request and the reported state can never silently disagree. Requesting either flight state asks for confirmation first. States the ground cannot request — `BOOT`, the setup states and `FAULT_ERROR` — appear as a disabled `(reported)` entry so the drone's real state is always visible.
+- **Flight mode** is one control rather than two. The selector shows the drone's reported `Drone::States` and follows it whenever the drone changes state on its own. Requesting a mode switches the selector to the requested state and highlights it until telemetry confirms the change, so the request and the reported state can never silently disagree. Requesting either flight state asks for confirmation first, in a bar next to the selector (never a browser dialog, which would freeze the heartbeat and trip the watchdog). States the ground cannot request — `BOOT`, the setup states and `FAULT_ERROR` — appear as a disabled `(reported)` entry so the drone's real state is always visible.
 
 Both chips dim when no telemetry has arrived for 2 seconds.
 
@@ -160,7 +164,58 @@ The firmware acts on the heartbeat's requested state only when it **changes**, s
 
 - Disconnecting, stopping demo mode, or 2 seconds without telemetry releases the request to Safe, with a toast and a terminal line.
 - Whenever the drone reports a state it reached on its own — a watchdog trip, a fault, its boot sequence — the selector follows it and the request is released to Safe.
-- An armed state is never adopted automatically. Taking control again is always an explicit request, which is what produces the `SAFE` → flight edge the firmware honors and what clears a latched `TRIPPED`.
+- An armed state is never adopted automatically. Resuming flight is always an explicit request, which is what produces the `SAFE` → flight edge the firmware honors and what clears a latched `TRIPPED`.
+- Handing control to another client is the one exception: the new controller keeps asserting the previous pilot's request, so the mode carries over. See [Pilot handoff](#pilot-handoff).
+
+### Multiple clients
+
+Several people can open the dashboard at once, for example one piloting while another reads telemetry. The header's **Role** chip shows whether this tab is the **Controller** or a **Viewer**.
+
+| Capability | Controller | Viewer |
+|---|:-:|:-:|
+| Telemetry, graphs, map, packet monitor, terminal | Yes | Yes |
+| Flight-mode requests, commands, heartbeats | Yes | No |
+| Connect / disconnect the serial port | Yes | No |
+| Config reads and writes | Yes | Yes |
+| SD log start / stop / mark | Yes | Yes |
+| E-STOP | Yes | Yes |
+| Request control | n/a | Yes |
+
+The first client to connect becomes the controller. A vacant seat is never filled automatically except by a viewer who has asked for it. The server enforces all of this; a viewer's disabled controls are a convenience, not the safeguard.
+
+#### Pilot handoff
+
+1. A viewer selects **Take control**. Nothing changes for the pilot yet. If nobody holds control, the viewer gets it at once.
+2. The pilot sees a bar: *Hand over* or *Decline*.
+3. The requester sees *Waiting for the pilot to approve*, with **Override** (after a confirmation) and **Cancel**. After a decline the bar stays so Override is still available.
+4. On approval or override the server switches the seat in one step. The new controller keeps asserting the previous pilot's requested state, so the firmware sees a repeat rather than a change: **the flight mode carries over and the watchdog is never starved.** The identify handshake is skipped because the link mode is shared.
+
+The old pilot's tab becomes read-only. Its last in-flight heartbeats are dropped silently for a few seconds instead of raising errors. Only one request can be pending at a time. If the pilot disconnects or releases control while someone is waiting, that viewer gets the seat and starts from `SAFE`.
+
+#### E-STOP
+
+The **E-STOP** button in the header works from any client and never changes who is in control. The server tells the controller's tab to request `SAFE` and zero the motors. As a backstop that does not depend on that tab, the server also drops everything the controller sends until the tab acknowledges, so the drone's watchdog disarms the vehicle even if the tab is frozen. Every client is notified. With no controller, the viewer is told nobody is transmitting.
+
+#### Alerts when a tab is not in focus
+
+An E-STOP, a control request, or losing control also flashes the tab title, beeps, vibrates where supported, and raises a desktop notification if permitted. Nothing fires for the tab you are looking at. Sound and notification permission are requested on your first click. Desktop notifications need https or localhost.
+
+#### Shared state
+
+- **Packet numbers.** The server stamps every outgoing frame with one shared counter. Each tab's packet monitor shows the frames the server actually put on the wire, including other clients' traffic, with the real numbers.
+- **Config cache.** The server remembers the last confirmed config values. New and reconnecting tabs receive them immediately. **Read Current Values** always asks the drone, and the result is sent to every open tab. Config writes the drone accepts update the cache the same way. The cache clears when the serial port connects or disconnects.
+
+### Flight-state rules
+
+Enforced by the server for every client, and mirrored in the dashboard:
+
+| Vehicle state | Gimbal commands | Motor speed | Config writes / reset | Log start / stop | Log mark | Config reads |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `SAFE` and setup states | Blocked | Blocked | Allowed | Allowed | Allowed | Allowed |
+| `READY_ARMED` | Allowed | Zero only | Allowed | Allowed | Allowed | Allowed |
+| `MAN_FLIGHT`, `AUTO_FLIGHT` | Allowed | Allowed | **Blocked** | **Blocked** | Allowed | Allowed |
+
+A command is refused as a whole frame when the state does not allow it. While merely armed, the dashboard sends every command with zero motor speed. The motor sliders reset to 0 and lock whenever the vehicle is not in flight. If the mode is unknown (no telemetry yet) nothing is blocked. The firmware may still refuse a log start or stop on its own.
 
 ### Live telemetry
 
@@ -230,7 +285,7 @@ The command panel sends type `4` command packets containing:
 - top motor speed (percent, scaled to 0 to 255 on the wire)
 - bottom motor speed (percent, scaled to 0 to 255 on the wire)
 
-The motor sliders are entered in percent (0 to 100) and are scaled to the 0 to 255 wire value when the command is encoded. Motor output is gated by the drone's own state, so the dashboard no longer carries a separate output interlock. The **Stop Motors** action immediately sets both motor commands to zero and transmits a command frame.
+The motor sliders are entered in percent (0 to 100) and are scaled to the 0 to 255 wire value when the command is encoded. The dashboard carries no separate output interlock; instead the vehicle state gates movement (see [Flight-state rules](#flight-state-rules)). Commands are viewer-locked and disabled in `SAFE`, and the motor sliders only work in flight. **Stop Motors** immediately sets both motor commands to zero and transmits a command frame when the state allows it.
 
 Continuous transmission can be enabled at a configurable rate from 1 to 50 Hz.
 
@@ -269,7 +324,7 @@ byte 2      version     0x01
 byte 3      packetNum   uint16 little-endian, low byte
 byte 4      packetNum   uint16 little-endian, high byte
 byte 5      type        uint8
-byte 6      length      uint8; payload length from 0 to 60
+byte 6      length      uint8; payload length from 0 to 64
 byte 7..    payload     exactly length bytes
 final - 2   CRC low     CRC-16/CCITT-FALSE, little-endian
 final - 1   CRC high
@@ -287,11 +342,15 @@ Total frame size:
 |---:|---|---|---|
 | 0 | `RAW` | Both | Variable, 0–64 bytes |
 | 1 | `DEBUG_TEXT` | Drone to dashboard | Variable, 0–64 bytes |
-| 2 | `RADIO_PACKET` | Drone to dashboard | Variable, 0–64 bytes |
+| 2 | `RADIO_PACKET` | Both | Variable, 0–64 bytes |
 | 3 | `TELEMETRY` | Drone to dashboard | Exactly 64 bytes |
 | 4 | `COMMAND` | Dashboard to drone | Exactly 8 bytes |
 | 5 | `CONFIG` | Both | Variable, 3–60 bytes |
+| 6 | `LOG_STATUS` | Drone to dashboard | Exactly 36 bytes |
+| 7 | `LOG_CONTROL` | Dashboard to drone | 8–49 bytes |
 | 10 | `HEARTBEAT` | Dashboard to drone | Exactly 8 bytes, every 25 ms |
+
+Values 8 and 9 are unused. `HEARTBEAT` shares its number with the RF message so the same 8 bytes carry the same type id on both links. `LOG_STATUS` and `LOG_CONTROL` are USB only; over the radio they are carried as the RF messages below.
 
 All multibyte fields are little-endian.
 
@@ -325,7 +384,7 @@ The client parser:
 
 1. scans the byte stream for `A5 5A`
 2. validates protocol version `1`
-3. validates a payload length from 0 to 60
+3. validates a payload length from 0 to 64
 4. waits for the complete `9 + length` byte frame
 5. calculates and validates the CRC
 6. emits the decoded packet
@@ -393,7 +452,7 @@ An escalation out of `SAFE` is also refused until the vehicle has been in `SAFE`
 
 To keep the packet monitor readable, it logs only the first heartbeat after connecting and each heartbeat whose `requestedState` has changed.
 
-Browsers throttle timers in background tabs, so heartbeats can slow down or stop when the dashboard tab is not in the foreground — which, now that the watchdog is enforced, will disarm a flying vehicle.
+The heartbeat tick runs in a Web Worker, which browsers do not throttle the way they throttle page timers, so a controller tab in the background keeps feeding the watchdog. The page falls back to a normal timer only if workers are unavailable. Only the controller sends heartbeats; the server rejects them from anyone else.
 
 ### `Drone::States`
 
@@ -465,6 +524,66 @@ The same byte and encoding appear at telemetry offset 54 and at offset 7 of the 
 
 Alert on `TRIPPED` rather than on the state transition. It is latched precisely so the event survives the outage that caused it: over the radio nothing arrives while the link is down, so the `currentMode` change and the drone's `DEBUG_TEXT` are already in the past by the time packets resume.
 
+## SD log protocol
+
+### `LOG_STATUS` (type 6, USB, 36 bytes)
+
+| Offset | Size | Field | Encoding / unit |
+|---:|---:|---|---|
+| 0 | 1 | `state` | uint8, see below |
+| 1 | 1 | `flags` | bit 0 file open, 1 has file, 2 card needs formatting, 3 not exFAT, 4 card removed (latched until a card mounts) |
+| 2 | 2 | `fileIndex` | uint16 LE (`LOGnnn.BIN`) |
+| 4 | 4 | `cardKiB` | uint32 LE |
+| 8 | 4 | `freeKiB` | uint32 LE |
+| 12 | 4 | `fileBytes` | uint32 LE |
+| 16 | 4 | `bytesPerSec` | uint32 LE |
+| 20 | 4 | `secondsRemaining` | uint32 LE, time before the oldest log is overwritten |
+| 24 | 4 | `dropped` | uint32 LE |
+| 28 | 2 | `writeErrors` | uint16 LE |
+| 30 | 1 | `bufferPeakPct` | uint8 |
+| 31 | 1 | `commandCount` | uint8, increments per handled control |
+| 32 | 1 | `commandResult` | uint8, see below |
+| 33 | 2 | `filesRecycled` | uint16 LE |
+| 35 | 1 | `marks` | uint8 |
+
+| `state` | Name | `commandResult` | Meaning |
+|---:|---|---:|---|
+| 0 | No card | 0 | OK |
+| 1 | Stopped | 1 | Refused while armed or flying |
+| 2 | Logging | 2 | No SD card |
+| 3 | Recovering (write failed, still buffering) | 3 | Already in that state |
+| 4 | Card removed (buffering in RAM, resumes when the card returns, in flight too) | 4 | SD card error |
+| | | 5 | Unknown action (older firmware) |
+
+### `LOG_CONTROL` (type 7, USB, 8–49 bytes)
+
+Byte 0 is the action: `1` start, `2` stop, `3` mark. For a mark, an ASCII label follows (up to 48 characters, non-printable characters sent as `?`), padded with NULs to at least 8 bytes.
+
+### Over the radio
+
+The radio link carries the same information in fixed 8-byte RF messages, forwarded inside `RADIO_PACKET`:
+
+| RF type | Name | Contents |
+|---:|---|---|
+| 11 | `LOG_STATUS0` | `state`, `flags`, `fileIndex` (u16), file size in KiB (u32) |
+| 12 | `LOG_STATUS1` | free KiB (u32), minutes remaining (u16), card size in GiB (u16) |
+| 13 | `LOG_STATUS2` | `dropped` (u16), `writeErrors`, `bufferPeakPct`, `commandCount`, `commandResult`, `filesRecycled` (u8), `marks` |
+| 14 | `LOG_CONTROL` | Same as USB, but a mark label is limited to 7 characters |
+
+Radio sizes are coarser (KiB, whole minutes, whole GiB) and the dashboard scales them back to the USB shape.
+
+## WebSocket protocol
+
+Browsers talk to the server at `/ws`. Binary messages are serial frames; text messages are JSON.
+
+**Binary, client to server.** Each message must be exactly one complete, CRC-valid frame. The server rewrites the packet number and CRC with its shared counter before writing to the serial port, and refuses the frame, with an `error` event, if the sender's role or the vehicle state does not allow it. A message holding more than one frame, or a malformed frame, is refused.
+
+**Binary, server to client.** Raw serial bytes from the drone, as before.
+
+**Actions (client to server):** `connect`, `disconnect`, `listPorts`, `status`, `ping`, `requestControl`, `respondControl` (`accept`), `cancelRequest`, `overrideControl`, `releaseControl`, `estop`, `estopAck`, `requestedState` (`state`, controller only), `linkMode` (`mode`, `known`, controller only), `configCache` (`entries`).
+
+**Events (server to client):** `status`, `ports`, `error`, `pong`, `role` (role, `reason`, `inheritedState`, `viewers`), `controlRequest`, `controlRequestState`, `estop`, `estopNotice`, `estopResult`, `linkMode`, `configCache`, and `tx` (a base64 frame the server put on the wire, with its sender's role).
+
 ## Adding packet types
 
 Packet definitions are centralized in `src/protocol.js` in `PACKET_SCHEMAS`.
@@ -514,7 +633,8 @@ When adding a packet type:
 .
 ├── index.html                 Dashboard markup
 ├── styles.css                Dashboard styling
-├── server.py                 HTTP, WebSocket, and serial bridge
+├── server.py                 HTTP, WebSocket, and serial bridge; roles and handoff
+├── framing.py                Frame stamping, per-role and per-state frame rules
 ├── requirements.txt          Python dependencies
 ├── start-dashboard.sh        Linux/macOS launcher
 ├── start-dashboard.bat       Windows launcher
@@ -523,7 +643,8 @@ When adding a packet type:
 │   ├── protocol.js           Packet schemas, CRC, encoding, and decoding
 │   └── serial-link.js        WebSocket link and streaming frame parser
 └── tests/
-    └── protocol.test.mjs     Protocol and parser tests
+    ├── protocol.test.mjs     Protocol and parser tests
+    └── test_framing.py       Server frame rules (roles, flight state, stamping)
 ```
 
 ## Testing
@@ -532,6 +653,7 @@ Run the JavaScript protocol tests with Node.js:
 
 ```bash
 node tests/protocol.test.mjs
+python -m unittest tests.test_framing   # from the repo root, in the virtualenv
 ```
 
 The tests cover:
@@ -544,6 +666,7 @@ The tests cover:
 - fragmented input
 - CRC rejection and stream recovery
 - protocol-version rejection
+- server frame rules: viewer scope, flight-state gating, motors only in flight, shared packet numbering, CRC, and drone-mode tracking
 
 ## Linux serial permissions
 
@@ -589,13 +712,17 @@ Verify that the firmware and dashboard both use:
 - Check that latitude and longitude are nonzero and within valid ranges.
 - Check the browser developer console for blocked Leaflet or imagery requests.
 
-### Another browser can control the drone
+### My controls are disabled and the role says Viewer
 
-This is expected. The server broadcasts incoming serial data to every connected client and accepts outgoing bytes from every connected client. Run the dashboard only on a trusted network or place it behind an authenticated reverse proxy.
+Another client holds control. Use **Take control** in the header; the pilot can approve, or you can override. A tab also becomes a viewer if its connection to the server dropped and someone else took the seat meanwhile.
+
+### The server says a frame was refused
+
+Check the message: viewers may only send config and SD-log frames, commands are refused in `SAFE`, motors only run in flight, and config writes and log start/stop are blocked in flight. Third-party WebSocket clients must send exactly one valid frame per message.
 
 ## Security notes
 
-The built-in server does not provide authentication, authorization, or TLS. Anyone who can reach the server can potentially connect the serial port and send command packets to the drone.
+The built-in server does not provide authentication, authorization, or TLS. Roles prevent accidents between cooperating operators; they are not access control. Anyone who can reach the server can open the dashboard, press **E-STOP**, request or override control, and then fly the vehicle.
 
 Recommended deployment practices:
 
