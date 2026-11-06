@@ -116,6 +116,11 @@ h3 { margin-top: 18px; font-size: .9rem; color: var(--muted); }
   font-size: .82rem;
   transition: opacity .2s ease;
 }
+.estop-all { font-weight: 800; letter-spacing: .06em; padding: 8px 16px; box-shadow: 0 0 0 2px rgba(255, 101, 119, .35); }
+.role-chip[hidden], .role-chip button[hidden] { display: none; }
+body.viewer #tab-commands { opacity: .55; }
+.mode-confirm[hidden] { display: none; }
+.mode-confirm { border-color: rgba(255, 190, 85, .6); }
 .vehicle-chip-label, .vehicle-chip-detail { color: var(--muted); }
 .vehicle-chip strong { font-family: "SFMono-Regular", Consolas, monospace; font-size: .95rem; }
 .vehicle-chip[data-tone="ok"] strong { color: var(--success); }
