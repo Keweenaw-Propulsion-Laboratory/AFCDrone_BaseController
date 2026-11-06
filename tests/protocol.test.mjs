@@ -11,6 +11,8 @@ import {
   COMMAND_FRAME_SIZE,
   TELEMETRY_FRAME_SIZE,
   MAX_PAYLOAD_SIZE,
+  MAX_FRAME_SIZE,
+  CONFIG_MAX_PAYLOAD_SIZE,
   PACKET_NUMBER_OFFSET,
   TYPE_OFFSET,
   LENGTH_OFFSET,
@@ -31,12 +33,36 @@ import {
   bytesToHex,
   DRONE_STATES,
   formatDroneState,
+  isFlightState,
+  REQUESTABLE_DRONE_STATES,
+  ARMED_DRONE_STATES,
+  isRequestableState,
+  HEARTBEAT_DEFAULT_STATE_REQUEST,
+  HEARTBEAT_PAYLOAD_SIZE,
+  HEARTBEAT_INTERVAL_MS,
+  WATCHDOG_TIMEOUT_MS,
+  WATCHDOG_BITS,
+  batteryPercent,
+  formatVoltage,
+  LOG_STATUS_PAYLOAD_SIZE,
+  LOG_CONTROL_PAYLOAD_SIZE,
+  LOG_STATES,
+  LOG_ACTIONS,
+  LOG_RESULTS,
+  formatBytes,
+  formatDuration,
+  formatLogFileName,
+  LOG_MARK_LABEL_MAX,
+  RADIO_LOG_MARK_LABEL_MAX,
 } from '../src/protocol.js';
 import {
   encodeRadioPacketEnvelope,
   encodeRadioCommandEnvelope,
+  encodeRadioHeartbeatEnvelope,
   encodeRadioConfigEnvelope,
+  encodeRadioLogControlEnvelope,
   applyRadioStatusToTelemetry,
+  applyRadioLogStatus,
   sendRadioConfigSequence,
 } from '../src/radio-relay.js';
 import { PacketStreamParser } from '../src/serial-link.js';
@@ -45,17 +71,28 @@ import { quaternionToEulerDegrees } from '../src/orientation-math.js';
 assert.equal(crc16CcittFalse(new TextEncoder().encode('123456789')), 0x29b1);
 assert.equal(FRAME_OVERHEAD, 9);
 assert.equal(COMMAND_FRAME_SIZE, 17);
-assert.equal(TELEMETRY_FRAME_SIZE, 63);
+// The telemetry record grew 54 -> 64 at the tail; the frame grew with it.
+assert.equal(TELEMETRY_PAYLOAD_SIZE, 64);
+assert.equal(TELEMETRY_FRAME_SIZE, 73);
+
+// The USB payload ceiling went 60 -> 64, so a maximum frame is 73 bytes. A
+// UART relay forwarding these needs SERIAL_TX_BUFFER_SIZE >= 74, because
+// availableForWrite() never exceeds SERIAL_TX_BUFFER_SIZE - 1 and a frame
+// that never fits is never written and wedges the queue behind it.
+assert.equal(MAX_PAYLOAD_SIZE, 64);
+assert.equal(MAX_FRAME_SIZE, 73);
+// CONFIG deliberately did not grow with the ceiling.
+assert.equal(CONFIG_MAX_PAYLOAD_SIZE, 60);
 
 const commandSchema = getSchemaById(USB_MESSAGE_TYPES.COMMAND);
-// Gimbal X/Y are entered and decoded in degrees (-20..20); the wire value is
+// Gimbal pitch/yaw are entered and decoded in degrees (-20..20); the wire value is
 // degrees * 1638, per the flight loop's normalization factor.
 const commandValues = {
   flags: { targSlot: true, activeSlot: false },
-  gimbalX: -12,
-  gimbalY: 18,
-  motor0Speed: 67,
-  motor1Speed: 89,
+  gimbalPitch: -12,
+  gimbalYaw: 18,
+  motorTopSpeed: 67,
+  motorBottomSpeed: 89,
   unused: 0,
 };
 const commandPayload = encodePayload(commandSchema, commandValues);
@@ -67,15 +104,15 @@ assert.equal(decodedCommand.flags._raw, 0x01);
 assert.equal(decodedCommand.flags.targSlot, true);
 assert.equal(decodedCommand.flags.activeSlot, false);
 assert.equal(decodedCommand.flags._reserved, 0);
-assert.equal(decodedCommand.gimbalX, -12);
-assert.equal(decodedCommand.gimbalY, 18);
-assert.equal(decodedCommand.motor0Speed, 67);
-assert.equal(decodedCommand.motor1Speed, 89);
+assert.equal(decodedCommand.gimbalPitch, -12);
+assert.equal(decodedCommand.gimbalYaw, 18);
+assert.equal(decodedCommand.motorTopSpeed, 67);
+assert.equal(decodedCommand.motorBottomSpeed, 89);
 assert.equal(decodedCommand.unused, 0);
 
 // Out-of-range degree input must clamp to +-20 before scaling, not wrap
 // around the wire int16 the way an unclamped 100*1638 would.
-const clampedPayload = encodePayload(commandSchema, { ...commandValues, gimbalX: 100, gimbalY: -100 });
+const clampedPayload = encodePayload(commandSchema, { ...commandValues, gimbalPitch: 100, gimbalYaw: -100 });
 const clampedView = new DataView(clampedPayload.buffer, clampedPayload.byteOffset, clampedPayload.byteLength);
 assert.equal(clampedView.getInt16(1, true), Math.round(20 * 1638));
 assert.equal(clampedView.getInt16(3, true), Math.round(-20 * 1638));
@@ -156,13 +193,35 @@ assert.equal(decodedTelemetry.posZ, 33);
 assert.ok(Math.abs(decodedTelemetry.latitude - 47.1164) < 0.00001);
 assert.ok(Math.abs(decodedTelemetry.longitude - (-88.5385)) < 0.00001);
 assert.throws(
-  () => decodePayload(telemetrySchema, telemetryPayload.slice(0, 53)),
-  /exactly 54 bytes/,
+  () => decodePayload(telemetrySchema, telemetryPayload.slice(0, 63)),
+  /exactly 64 bytes/,
 );
+// A 54-byte record is the old firmware's; it is no longer accepted.
 assert.throws(
-  () => decodePayload(telemetrySchema, new Uint8Array(55)),
-  /exactly 54 bytes/,
+  () => decodePayload(telemetrySchema, new Uint8Array(54)),
+  /exactly 64 bytes/,
 );
+
+// watchDog lives at offset 54, and bytes 55-63 are reserved zeros. Every
+// field above keeps the offset it had in the 54-byte record.
+assert.equal(telemetryView.getUint8(54), 0);
+assert.deepEqual(Array.from(telemetryPayload.subarray(55)), new Array(9).fill(0));
+assert.equal(decodedTelemetry.watchDog.fed, false);
+assert.equal(decodedTelemetry.watchDog.tripped, false);
+
+const trippedTelemetry = encodePayload(telemetrySchema, {
+  ...telemetryValues,
+  watchDog: { fed: true, tripped: true },
+});
+assert.equal(trippedTelemetry.length, TELEMETRY_PAYLOAD_SIZE);
+assert.equal(trippedTelemetry[54], 0b11);
+const decodedTripped = decodePayload(telemetrySchema, trippedTelemetry);
+assert.equal(decodedTripped.watchDog.fed, true);
+assert.equal(decodedTripped.watchDog.tripped, true);
+assert.equal(decodedTripped.watchDog._reserved, 0);
+// The pre-64-byte fields are untouched by the extension.
+assert.equal(decodedTripped.loopTimeAvg, decodedTelemetry.loopTimeAvg);
+assert.ok(Math.abs(decodedTripped.longitude - decodedTelemetry.longitude) < 1e-9);
 
 const telemetryFrame = buildPacket(0x4321, USB_MESSAGE_TYPES.TELEMETRY, telemetryPayload);
 assert.equal(telemetryFrame.length, TELEMETRY_FRAME_SIZE);
@@ -280,7 +339,7 @@ assert.deepEqual(decodedReadResponse.statuses[0], { key: 0, result: CONFIG_RESUL
 assert.deepEqual(decodedReadResponse.statuses[1], { key: 4, result: CONFIG_RESULTS.OK, value: 90 });
 
 const maxReadResponsePayload = new Uint8Array(4 + 8 * 7);
-assert.equal(maxReadResponsePayload.byteLength, MAX_PAYLOAD_SIZE);
+assert.equal(maxReadResponsePayload.byteLength, CONFIG_MAX_PAYLOAD_SIZE);
 
 const configFrame = buildPacket(0x55, USB_MESSAGE_TYPES.CONFIG, setRequestPayload);
 const configParser = new PacketStreamParser();
@@ -291,10 +350,11 @@ assert.deepEqual(Array.from(configPackets[0].payload), Array.from(setRequestPayl
 
 // --- RF-level message codecs (STATUS0-6, radio CONFIG, COMMAND reuse) ---
 
-// STATUS0 carries no RSSI: the drone's StatusMsg0_t pads out its last byte and
-// reports link strength from StatusMsg2_t instead.
+// STATUS0 carries no RSSI: the drone's StatusMsg0_t reports link strength
+// from StatusMsg2_t instead. Its last byte used to be a zero pad and now
+// carries the watchdog flags - same 8-byte wire size either way.
 const status0Bytes = encodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, {
-  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4, reserved: 0,
+  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4,
 });
 assert.deepEqual(Array.from(status0Bytes), [0xe8, 0x03, 0xd0, 0x07, 0xf4, 0x01, 0x04, 0x00]);
 const decodedStatus0 = decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Bytes);
@@ -303,6 +363,26 @@ assert.equal(decodedStatus0.loopTimeMax, 2000);
 assert.equal(decodedStatus0.runTime, 500);
 assert.equal(decodedStatus0.currentMode, 4);
 assert.equal(decodedStatus0.rssi, undefined);
+assert.equal(decodedStatus0.watchDog.fed, false);
+assert.equal(decodedStatus0.watchDog.tripped, false);
+
+// The flag byte is encoded identically on both transports.
+const status0Tripped = encodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, {
+  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: DRONE_STATES.SAFE,
+  watchDog: { fed: true, tripped: true },
+});
+assert.equal(status0Tripped.length, 8);
+assert.equal(status0Tripped[7], 0b11);
+assert.equal(status0Tripped[7], trippedTelemetry[54]);
+const decodedStatus0Tripped = decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Tripped);
+assert.deepEqual(decodedStatus0Tripped.watchDog, decodedTripped.watchDog);
+assert.equal(WATCHDOG_BITS.FED, 0);
+assert.equal(WATCHDOG_BITS.TRIPPED, 1);
+
+// STATUS0 relays the watchdog into the same telemetry shape direct mode uses.
+const relayWatchdogTelemetry = applyRadioStatusToTelemetry({}, RADIO_MESSAGE_TYPES.STATUS0, decodedStatus0Tripped);
+assert.equal(relayWatchdogTelemetry.watchDog.tripped, true);
+assert.equal(relayWatchdogTelemetry.currentMode, DRONE_STATES.SAFE);
 
 // STATUS2's motor fields are 2 bytes each on the wire (matching the drone's
 // real StatusMsg2_t) - values above 255 prove this isn't truncated to a byte
@@ -321,7 +401,7 @@ assert.equal(decodedStatus2.rssi, 80);
 const radioConfigBytes = encodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, {
   version: CONFIG_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
 });
-assert.deepEqual(Array.from(radioConfigBytes), [0x02, 0x01, 0x04, 0x00, 0x5a, 0x00, 0x00, 0x00]);
+assert.deepEqual(Array.from(radioConfigBytes), [CONFIG_VERSION, 0x01, 0x04, 0x00, 0x5a, 0x00, 0x00, 0x00]);
 assert.deepEqual(decodeRadioMessage(RADIO_MESSAGE_TYPES.CONFIG, radioConfigBytes), {
   version: CONFIG_VERSION, state: CONFIG_OPS.READ, configKey: 4, value: 90,
 });
@@ -336,10 +416,25 @@ assert.equal(RADIO_HANDSHAKE.IDENTIFY_QUERY, 0x3f);
 assert.equal(RADIO_HANDSHAKE.DEVICE_KIND_DRONE_DIRECT, 0x01);
 assert.equal(RADIO_HANDSHAKE.DEVICE_KIND_BASE_STATION_RELAY, 0x02);
 
-assert.equal(formatDroneState(DRONE_STATES.FLIGHT), 'Flight');
+assert.equal(DRONE_STATES.SAFE, 4);
+assert.equal(DRONE_STATES.READY_ARMED, 10);
+assert.equal(DRONE_STATES.MAN_FLIGHT, 11);
+assert.equal(DRONE_STATES.AUTO_FLIGHT, 12);
+assert.equal(DRONE_STATES.FAULT_ERROR, 255);
+assert.equal(formatDroneState(DRONE_STATES.SAFE), 'Safe');
 assert.equal(formatDroneState(DRONE_STATES.READY_ARMED), 'Ready / Armed');
+assert.equal(formatDroneState(DRONE_STATES.MAN_FLIGHT), 'Manual Flight');
+assert.equal(formatDroneState(DRONE_STATES.AUTO_FLIGHT), 'Auto Flight');
+assert.equal(formatDroneState(DRONE_STATES.FAULT_ERROR), 'Fault Error');
 assert.equal(formatDroneState(undefined), '--');
 assert.equal(formatDroneState(99), 'Unknown (99)');
+
+// Only the flight states drive the motors.
+assert.ok(isFlightState(DRONE_STATES.MAN_FLIGHT));
+assert.ok(isFlightState(DRONE_STATES.AUTO_FLIGHT));
+assert.ok(!isFlightState(DRONE_STATES.READY_ARMED));
+assert.ok(!isFlightState(DRONE_STATES.SAFE));
+assert.ok(!isFlightState(undefined));
 
 // --- RADIO_PACKET envelope: bidirectional, 11 (outbound) or 12 (inbound) bytes ---
 
@@ -405,7 +500,10 @@ assert.deepEqual(Array.from(radioPacketFramePackets[0].payload), Array.from(rece
 const relayTelemetry = {};
 applyRadioStatusToTelemetry(relayTelemetry, RADIO_MESSAGE_TYPES.STATUS0,
   decodeRadioMessage(RADIO_MESSAGE_TYPES.STATUS0, status0Bytes));
-assert.deepEqual(relayTelemetry, { loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4 });
+assert.deepEqual(relayTelemetry, {
+  loopTimeAvg: 1000, loopTimeMax: 2000, runTime: 500, currentMode: 4,
+  watchDog: { _raw: 0, fed: false, tripped: false, _reserved: 0 },
+});
 
 applyRadioStatusToTelemetry(relayTelemetry, RADIO_MESSAGE_TYPES.STATUS2, decodedStatus2);
 assert.equal(relayTelemetry.motor1Set, 513);
@@ -531,5 +629,220 @@ const roll90 = quaternionToEulerDegrees(half90, 0, 0, half90);
 assert.ok(Math.abs(roll90.roll - 90) < 1e-6, `expected roll ~90, got ${roll90.roll}`);
 assert.ok(Math.abs(roll90.pitch) < 1e-6);
 assert.ok(Math.abs(roll90.yaw) < 1e-6);
+
+// --- HEARTBEAT: 8 bytes, byte 0 = requested Drone::States (edge triggered) ---
+
+// Heartbeat shares one type number across USB and RF.
+assert.equal(USB_MESSAGE_TYPES.HEARTBEAT, 10);
+assert.equal(USB_MESSAGE_TYPES.HEARTBEAT, RADIO_MESSAGE_TYPES.HEARTBEAT);
+assert.equal(RADIO_MESSAGE_TYPES.HEARTBEAT, 10);
+assert.equal(RADIO_MESSAGE_TYPE_NAMES[RADIO_MESSAGE_TYPES.HEARTBEAT], 'Heartbeat');
+
+const heartbeatSchema = getSchemaById(USB_MESSAGE_TYPES.HEARTBEAT);
+assert.ok(!getOutboundSchemas().some((schema) => schema.id === USB_MESSAGE_TYPES.HEARTBEAT));
+
+// There is no "no request" value any more: the firmware acts on byte 0 only
+// when it CHANGES, so a client always asserts something, and what it asserts
+// when it wants nothing is SAFE. A heartbeat sent before a dropout is
+// byte-identical to one sent after it, so honoring repeats would let a
+// reconnecting client silently re-arm the vehicle.
+const idleHeartbeat = encodePayload(heartbeatSchema, {});
+assert.equal(idleHeartbeat.length, HEARTBEAT_PAYLOAD_SIZE);
+assert.deepEqual(Array.from(idleHeartbeat), [DRONE_STATES.SAFE, 0, 0, 0, 0, 0, 0, 0]);
+assert.equal(HEARTBEAT_DEFAULT_STATE_REQUEST, DRONE_STATES.SAFE);
+assert.ok(isRequestableState(HEARTBEAT_DEFAULT_STATE_REQUEST));
+
+// Only HEARTBEAT feeds the watchdog, and the cadence has to stay well inside
+// its expiry even after a couple of consecutive losses.
+assert.equal(WATCHDOG_TIMEOUT_MS, 100);
+assert.ok(HEARTBEAT_INTERVAL_MS >= 20 && HEARTBEAT_INTERVAL_MS <= 50);
+assert.ok(HEARTBEAT_INTERVAL_MS * 3 <= WATCHDOG_TIMEOUT_MS);
+
+const flightHeartbeat = encodePayload(heartbeatSchema, { requestedState: DRONE_STATES.MAN_FLIGHT });
+assert.deepEqual(Array.from(flightHeartbeat), [DRONE_STATES.MAN_FLIGHT, 0, 0, 0, 0, 0, 0, 0]);
+assert.equal(decodePayload(heartbeatSchema, flightHeartbeat).requestedState, DRONE_STATES.MAN_FLIGHT);
+
+// A fault request would still round-trip byte 0 intact at 255.
+assert.deepEqual(
+  Array.from(encodePayload(heartbeatSchema, { requestedState: DRONE_STATES.FAULT_ERROR })),
+  [255, 0, 0, 0, 0, 0, 0, 0],
+);
+assert.equal(buildPacket(1, USB_MESSAGE_TYPES.HEARTBEAT, flightHeartbeat).length, FRAME_OVERHEAD + 8);
+
+// Relay mode carries the identical 8 bytes as RF type 10.
+assert.deepEqual(
+  Array.from(encodeRadioMessage(RADIO_MESSAGE_TYPES.HEARTBEAT, { requestedState: DRONE_STATES.MAN_FLIGHT })),
+  Array.from(flightHeartbeat),
+);
+assert.deepEqual(
+  Array.from(encodeRadioHeartbeatEnvelope({ requestedState: DRONE_STATES.READY_ARMED })),
+  [1, 0, RADIO_MESSAGE_TYPES.HEARTBEAT, DRONE_STATES.READY_ARMED, 0, 0, 0, 0, 0, 0, 0],
+);
+assert.equal(
+  decodeRadioMessage(RADIO_MESSAGE_TYPES.HEARTBEAT, flightHeartbeat).requestedState,
+  DRONE_STATES.MAN_FLIGHT,
+);
+
+assert.ok(REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.SAFE));
+assert.ok(REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.READY_ARMED));
+assert.ok(REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.MAN_FLIGHT));
+assert.ok(REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.AUTO_FLIGHT));
+assert.ok(!REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.BOOT));
+assert.ok(!REQUESTABLE_DRONE_STATES.includes(DRONE_STATES.FAULT_ERROR));
+assert.ok(!isRequestableState(DRONE_STATES.RADIO_SETUP));
+assert.ok(!isRequestableState(undefined));
+
+// The state values are non-contiguous and were never what the older
+// published table said - nothing may index an array by them.
+assert.deepEqual(
+  [DRONE_STATES.BOOT, DRONE_STATES.RADIO_SETUP, DRONE_STATES.SENSOR_SETUP, DRONE_STATES.CONTROL_SETUP, DRONE_STATES.SAFE],
+  [0, 1, 2, 3, 4],
+);
+assert.deepEqual(
+  [DRONE_STATES.READY_ARMED, DRONE_STATES.MAN_FLIGHT, DRONE_STATES.AUTO_FLIGHT, DRONE_STATES.FAULT_ERROR],
+  [10, 11, 12, 255],
+);
+assert.deepEqual(Array.from(ARMED_DRONE_STATES), [10, 11, 12]);
+
+// --- Battery voltage: millivolts on the wire, 0 = not reported ---
+
+assert.equal(formatVoltage(16800), '16.80 V');
+assert.equal(formatVoltage(0), '--');
+assert.equal(formatVoltage(undefined), '--');
+assert.equal(batteryPercent(0), null);
+assert.equal(batteryPercent(Number.NaN), null);
+assert.equal(batteryPercent(13090), 0);
+assert.equal(batteryPercent(12000), 0);
+assert.equal(batteryPercent(16500), 100);
+assert.equal(batteryPercent(16800), 100);
+assert.ok(Math.abs(batteryPercent(14795) - 50) < 1e-9);
+
+// LOG_STATUS mirrors AFC-Drone src/usb.cpp's packed LogStatus, byte for byte.
+{
+  const payload = new Uint8Array(LOG_STATUS_PAYLOAD_SIZE);
+  const view = new DataView(payload.buffer);
+  view.setUint8(0, LOG_STATES.LOGGING);
+  view.setUint8(1, 0b1011); // FILE_OPEN | HAVE_FILE | SLOW_FILESYSTEM
+  view.setUint16(2, 7, true);
+  view.setUint32(4, 31_166_976, true);
+  view.setUint32(8, 30_000_000, true);
+  view.setUint32(12, 5_120_512, true);
+  view.setUint32(16, 104_000, true);
+  view.setUint32(20, 295_384, true);
+  view.setUint32(24, 3, true);
+  view.setUint16(28, 1, true);
+  view.setUint8(30, 12);
+  view.setUint8(31, 9);
+  view.setUint8(32, LOG_RESULTS.IN_FLIGHT);
+  view.setUint16(33, 2, true);
+  view.setUint8(35, 5);
+
+  const decoded = decodePayload(getSchemaById(USB_MESSAGE_TYPES.LOG_STATUS), payload);
+  assert.equal(decoded.state, LOG_STATES.LOGGING);
+  assert.equal(decoded.flags.fileOpen, true);
+  assert.equal(decoded.flags.haveFile, true);
+  assert.equal(decoded.flags.cardUnmountable, false);
+  assert.equal(decoded.flags.slowFilesystem, true);
+  assert.equal(decoded.flags.cardRemoved, false);
+  assert.equal(decoded.fileIndex, 7);
+  assert.equal(decoded.cardKiB, 31_166_976);
+  assert.equal(decoded.freeKiB, 30_000_000);
+  assert.equal(decoded.fileBytes, 5_120_512);
+  assert.equal(decoded.bytesPerSec, 104_000);
+  assert.equal(decoded.secondsRemaining, 295_384);
+  assert.equal(decoded.dropped, 3);
+  assert.equal(decoded.writeErrors, 1);
+  assert.equal(decoded.bufferPeakPct, 12);
+  assert.equal(decoded.commandCount, 9);
+  assert.equal(decoded.commandResult, LOG_RESULTS.IN_FLIGHT);
+  assert.equal(decoded.filesRecycled, 2);
+  assert.equal(decoded.marks, 5);
+  assert.throws(() => decodePayload(getSchemaById(USB_MESSAGE_TYPES.LOG_STATUS), new Uint8Array(32)));
+}
+
+{
+  const schema = getSchemaById(USB_MESSAGE_TYPES.LOG_CONTROL);
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.START })), [1, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.STOP })), [2, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(encodePayload(schema, { action: LOG_ACTIONS.STOP }).byteLength, LOG_CONTROL_PAYLOAD_SIZE);
+  assert.ok(!getOutboundSchemas().includes(schema), 'LOG_CONTROL is sent by the log panel, not the builder');
+
+  // MARK carries its label after the action byte; USB grows past 8 bytes for it.
+  const mark = encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'gust here' });
+  assert.deepEqual(Array.from(mark), [3, ...new TextEncoder().encode('gust here')]);
+  assert.deepEqual(decodePayload(schema, mark), { action: LOG_ACTIONS.MARK, label: 'gust here' });
+  const shortMark = encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'a' });
+  assert.equal(shortMark.byteLength, LOG_CONTROL_PAYLOAD_SIZE);
+  assert.deepEqual(decodePayload(schema, shortMark), { action: LOG_ACTIONS.MARK, label: 'a' });
+  assert.equal(encodePayload(schema, { action: LOG_ACTIONS.MARK, label: 'x'.repeat(80) }).byteLength, 1 + LOG_MARK_LABEL_MAX);
+  // Start/stop ignore any label.
+  assert.deepEqual(Array.from(encodePayload(schema, { action: LOG_ACTIONS.START, label: 'ignored' })), [1, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+// Radio LOG_CONTROL is exactly 8 bytes, so a mark label is cut to 7 characters.
+{
+  const message = encodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_CONTROL, { action: LOG_ACTIONS.MARK, label: 'oscillation' });
+  assert.equal(message.byteLength, 8);
+  assert.deepEqual(decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_CONTROL, message), { action: LOG_ACTIONS.MARK, label: 'oscilla' });
+  assert.equal(RADIO_LOG_MARK_LABEL_MAX, 7);
+  const envelope = encodeRadioLogControlEnvelope({ action: LOG_ACTIONS.STOP });
+  assert.equal(envelope[2], RADIO_MESSAGE_TYPES.LOG_CONTROL);
+  assert.deepEqual(Array.from(envelope.slice(3)), [2, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+// Radio LOG_STATUS0-2 mirror AFC-Drone include/radio.h and fold into the USB shape.
+{
+  const status0 = new Uint8Array(8);
+  const v0 = new DataView(status0.buffer);
+  v0.setUint8(0, LOG_STATES.LOGGING);
+  v0.setUint8(1, 0b0011);
+  v0.setUint16(2, 12, true);
+  v0.setUint32(4, 5000, true);
+
+  const status1 = new Uint8Array(8);
+  const v1 = new DataView(status1.buffer);
+  v1.setUint32(0, 30_000_000, true);
+  v1.setUint16(4, 4923, true);
+  v1.setUint16(6, 29, true);
+
+  const status2 = new Uint8Array([7, 0, 1, 12, 9, LOG_RESULTS.OK, 3, 4]);
+
+  const folded = {};
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS0, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS0, status0));
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS1, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS1, status1));
+  applyRadioLogStatus(folded, RADIO_MESSAGE_TYPES.LOG_STATUS2, decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS2, status2));
+  assert.equal(folded.state, LOG_STATES.LOGGING);
+  assert.equal(folded.flags.fileOpen, true);
+  assert.equal(folded.flags.haveFile, true);
+  {
+    const removed = new Uint8Array(8);
+    removed[0] = LOG_STATES.NO_CARD;
+    removed[1] = 0b10010; // HAVE_FILE | CARD_REMOVED
+    const flags = decodeRadioMessage(RADIO_MESSAGE_TYPES.LOG_STATUS0, removed).flags;
+    assert.equal(flags.cardRemoved, true);
+    assert.equal(flags.fileOpen, false);
+  }
+  assert.equal(folded.fileIndex, 12);
+  assert.equal(folded.fileBytes, 5000 * 1024);
+  assert.equal(folded.freeKiB, 30_000_000);
+  assert.equal(folded.secondsRemaining, 4923 * 60);
+  assert.equal(folded.cardKiB, 29 * 1024 * 1024);
+  assert.equal(folded.dropped, 7);
+  assert.equal(folded.writeErrors, 1);
+  assert.equal(folded.bufferPeakPct, 12);
+  assert.equal(folded.commandCount, 9);
+  assert.equal(folded.commandResult, LOG_RESULTS.OK);
+  assert.equal(folded.filesRecycled, 3);
+  assert.equal(folded.marks, 4);
+  assert.equal(RADIO_MESSAGE_TYPE_NAMES[RADIO_MESSAGE_TYPES.LOG_STATUS1], 'Log Status1');
+}
+
+assert.equal(formatBytes(512), '512 B');
+assert.equal(formatBytes(5_120_512), '4.9 MB');
+assert.equal(formatBytes(30_000_000 * 1024), '28.6 GB');
+assert.equal(formatDuration(295_384), '82 h 03 min');
+assert.equal(formatDuration(125), '2 min');
+assert.equal(formatDuration(42), '42 s');
+assert.equal(formatLogFileName(7), 'LOG007.BIN');
 
 console.log('Protocol framing and payload decoder tests passed');

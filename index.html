@@ -49,6 +49,53 @@
         <div id="connection-badge" class="connection-badge"><span id="connection-dot" class="status-dot"></span>Server Offline</div>
         <span id="link-mode-status" class="link-mode-badge">Link: Not connected</span>
       </div>
+      <div class="vehicle-status">
+        <div id="header-battery" class="vehicle-chip">
+          <span class="vehicle-chip-label">Battery</span>
+          <strong id="header-voltage">--</strong>
+          <span id="header-battery-percent" class="vehicle-chip-detail">No reading</span>
+        </div>
+        <!-- One control for both halves of the flight mode: the selector shows
+             what the drone reports, and switches to the requested state (with
+             a pending highlight) until telemetry confirms the change. -->
+        <div id="header-mode" class="vehicle-chip mode-chip">
+          <span class="vehicle-chip-label" id="header-mode-label">Flight mode</span>
+          <select id="mode-request" aria-labelledby="header-mode-label" disabled></select>
+          <span id="header-mode-detail" class="vehicle-chip-detail">No telemetry</span>
+        </div>
+        <button id="estop-all" class="danger estop-all" type="button" title="Emergency stop: seizes control, requests Safe and zeroes the motors. Works from any client.">E-STOP</button>
+        <div id="role-chip" class="vehicle-chip role-chip" hidden>
+          <span class="vehicle-chip-label">Role</span>
+          <strong id="role-label">Viewer</strong>
+          <span id="role-detail" class="vehicle-chip-detail">--</span>
+          <button type="button" id="role-take" class="secondary small">Take control</button>
+          <button type="button" id="role-release" class="secondary small" hidden>Release</button>
+        </div>
+        <!-- Controller side of a handoff: someone else asked for control. -->
+        <div id="control-request" class="vehicle-chip mode-confirm" role="alertdialog" aria-live="assertive" hidden>
+          <span>Another client is asking for control. Handing over keeps the current flight mode.</span>
+          <button type="button" id="control-request-accept" class="primary">Hand over</button>
+          <button type="button" id="control-request-decline" class="secondary">Decline</button>
+        </div>
+        <!-- Requester side: waiting on the controller, with an override. -->
+        <div id="control-wait" class="vehicle-chip mode-confirm" role="alertdialog" aria-live="polite" hidden>
+          <span id="control-wait-text">Waiting for the pilot to approve the handoff...</span>
+          <button type="button" id="control-wait-override" class="danger">Override</button>
+          <button type="button" id="control-wait-cancel" class="secondary">Cancel</button>
+        </div>
+        <!-- Non-blocking confirmation for flight-state requests. window.confirm
+             would freeze the page's timers and starve the drone's watchdog. -->
+        <div id="mode-confirm" class="vehicle-chip mode-confirm" role="alertdialog" aria-live="assertive" hidden>
+          <span id="mode-confirm-text">Request flight mode?</span>
+          <button type="button" id="mode-confirm-ok" class="primary">Confirm</button>
+          <button type="button" id="mode-confirm-cancel" class="secondary">Cancel</button>
+        </div>
+        <div id="header-log" class="vehicle-chip" title="No logger status">
+          <span class="vehicle-chip-label">SD log</span>
+          <strong id="header-log-state">--</strong>
+          <span id="header-log-detail" class="vehicle-chip-detail">No status</span>
+        </div>
+      </div>
     </header>
 
     <div id="server-warning" class="warning-banner">
@@ -179,6 +226,52 @@
           </article>
         </div>
 
+        <article class="panel log-panel">
+          <div class="panel-heading">
+            <div>
+              <h2>SD card log</h2>
+              <p id="log-subtitle">Flight data recorded to the drone's SD card</p>
+            </div>
+            <div class="toolbar-actions">
+              <span id="log-command-status" class="subtle"></span>
+              <label class="compact-field log-mark-field">
+                <span class="visually-hidden">Mark label</span>
+                <input id="log-mark-label" type="text" maxlength="48" placeholder="Mark label (optional)" autocomplete="off" disabled>
+              </label>
+              <button id="log-mark" class="secondary" type="button" disabled>Mark</button>
+              <button id="log-start" class="secondary" type="button" disabled>Start Log</button>
+              <button id="log-stop" class="secondary" type="button" disabled>Stop Log</button>
+            </div>
+          </div>
+          <div class="metric-grid">
+            <article id="log-state-card" class="metric-card">
+              <span class="metric-label">Logger</span>
+              <strong id="log-state">--</strong>
+              <small id="log-state-detail">No status received</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Current file</span>
+              <strong id="log-file-size">--</strong>
+              <small id="log-file-name">--</small>
+            </article>
+            <article class="metric-card">
+              <span class="metric-label">Free space</span>
+              <strong id="log-free">--</strong>
+              <small id="log-capacity">--</small>
+            </article>
+            <article id="log-remaining-card" class="metric-card">
+              <span class="metric-label">Log time remaining</span>
+              <strong id="log-remaining">--</strong>
+              <small id="log-rate">--</small>
+            </article>
+            <article id="log-health-card" class="metric-card">
+              <span class="metric-label">Recorder health</span>
+              <strong id="log-dropped">--</strong>
+              <small id="log-health-detail">--</small>
+            </article>
+          </div>
+        </article>
+
         <article class="panel map-panel">
           <div class="panel-heading map-heading">
             <div>
@@ -206,13 +299,14 @@
           <div class="panel-heading">
             <div>
               <h2>Latest telemetry</h2>
-              <p>Decoded from the packed 54-byte telemetry structure</p>
+              <p>Decoded from the packed 64-byte telemetry structure</p>
             </div>
             <div class="stats-inline">
               <span>RX <strong id="metric-rx">0</strong></span>
               <span>TX <strong id="metric-tx">0</strong></span>
               <span>Parse errors <strong id="metric-errors">0</strong></span>
               <span>Voltage <strong id="metric-voltage">--</strong></span>
+              <span id="telemetry-watchdog" title="No telemetry">Comm watchdog <strong id="metric-watchdog">--</strong></span>
             </div>
           </div>
           <div class="table-wrap">
@@ -250,26 +344,21 @@
               </fieldset>
 
               <label class="field field-span-2">
-                <span>Gimbal X (deg)</span>
-                <div class="range-pair"><input id="gimbal-x" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-x-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
+                <span>Gimbal pitch (deg)</span>
+                <div class="range-pair"><input id="gimbal-pitch" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-pitch-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Gimbal Y (deg)</span>
-                <div class="range-pair"><input id="gimbal-y" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-y-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
+                <span>Gimbal yaw (deg)</span>
+                <div class="range-pair"><input id="gimbal-yaw" type="range" min="-20" max="20" step="0.1" value="0"><input id="gimbal-yaw-number" type="number" min="-20" max="20" step="0.1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Motor 0 speed</span>
-                <div class="range-pair"><input id="motor-0" type="range" min="0" max="255" value="0"><input id="motor-0-number" type="number" min="0" max="255" value="0"></div>
+                <span>Top motor speed (%)</span>
+                <div class="range-pair"><input id="motor-top" type="range" min="0" max="100" step="1" value="0"><input id="motor-top-number" type="number" min="0" max="100" step="1" value="0"></div>
               </label>
               <label class="field field-span-2">
-                <span>Motor 1 speed</span>
-                <div class="range-pair"><input id="motor-1" type="range" min="0" max="255" value="0"><input id="motor-1-number" type="number" min="0" max="255" value="0"></div>
+                <span>Bottom motor speed (%)</span>
+                <div class="range-pair"><input id="motor-bottom" type="range" min="0" max="100" step="1" value="0"><input id="motor-bottom-number" type="number" min="0" max="100" step="1" value="0"></div>
               </label>
-            </div>
-
-            <div class="safety-strip">
-              <label class="switch-row"><input id="motor-enable" type="checkbox"><span>Enable nonzero motor output</span></label>
-              <p>When disabled, transmitted motor fields are forced to zero.</p>
             </div>
 
             <div class="command-footer">
@@ -315,10 +404,10 @@
             <span id="config-sync-status" class="subtle">Never synced</span>
           </div>
 
-          <p class="warning-banner config-warning">Configuration changes are rejected while the vehicle is in <code>FLIGHT</code>.</p>
+          <p class="warning-banner config-warning">Configuration changes are blocked while the vehicle is in flight (<code>MAN_FLIGHT</code> / <code>AUTO_FLIGHT</code>) &mdash; for every client. They are allowed while armed. A read is shared with every open dashboard.</p>
 
           <div class="config-toolbar">
-            <button id="config-read" class="secondary" type="button">Read Current Values</button>
+            <button id="config-read" class="secondary" type="button" title="Ask the drone for every value; the result is sent to every open dashboard">Read Current Values</button>
             <button id="config-apply" class="primary" type="button">Apply Changes</button>
             <button id="config-zero-all" class="danger" type="button">Reset to Defaults</button>
           </div>
@@ -345,7 +434,6 @@
               <button id="clear-packets" class="secondary" type="button">Clear</button>
             </div>
           </div>
-          <label class="compatibility-option"><input id="compat-telemetry" type="checkbox" checked><span>Treat 54-byte DEBUG_TEXT packets as telemetry until the firmware type-field bug is fixed</span></label>
           <div class="table-wrap">
             <table class="data-table packet-table">
               <thead><tr><th>Time</th><th>Dir</th><th>#</th><th>Type</th><th>Bytes</th><th>Summary</th><th></th></tr></thead>
