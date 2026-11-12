@@ -162,6 +162,8 @@ class RxScanner:
     def __init__(self) -> None:
         self._buffer = bytearray()
         self.mode: int | None = None
+        # Called with (type, payload) for every valid frame, if set.
+        self.on_frame = None
 
     def reset(self) -> None:
         self._buffer.clear()
@@ -188,6 +190,8 @@ class RxScanner:
                 continue
             del buf[:total]
             self._track(frame[TYPE_OFFSET], frame[PREFIX:total - CRC_SIZE])
+            if self.on_frame is not None:
+                self.on_frame(frame[TYPE_OFFSET], frame[PREFIX:total - CRC_SIZE])
 
     def _track(self, frame_type: int, payload: bytes) -> None:
         if frame_type == USB_TELEMETRY and len(payload) > TELEMETRY_MODE_OFFSET:

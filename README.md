@@ -135,7 +135,24 @@ Available options:
 --http-port PORT     Dashboard HTTP port; default: 8000
 --serial-port PORT   Serial port to open at startup
 --baud RATE          Startup baud rate; default: 115200
+--pendulum-log DIR   Log pendulum-test events from the base station to CSV in DIR
 --verbose            Enable debug logging
+```
+
+### Pendulum timing test
+
+With `--pendulum-log DIR`, each serial connection to a base station running the pendulum-test firmware (AFCDrone_BaseStation) writes a set of CSV files ([pendulum_log.py](pendulum_log.py)):
+
+| File | One row per | Columns |
+|---|---|---|
+| `pendulum_<stamp>_timesync.csv` | `BASE_TIMESYNC` clock-sync exchange | `seq`, `t1Us`, `t2Us`, `t4Us`, `prevSeq`, `prevTxMinusRxUs`, `rssi` |
+| `pendulum_<stamp>_passes.csv` | `BASE_MAG_PASS` magnet pass | `index`, `centroidUs`, `startUs`, `endUs`, `peakUs`, `peakRaw`, `baselineRaw`, `samples`, `maxGapUs` |
+| `pendulum_<stamp>_text.csv` | Debug text line | `text` |
+
+Every row also has `hostTime`, the PC clock when the row was written. It is only for orientation: USB delays make it useless for timing. All `*Us` columns are raw 32-bit `micros()` values from the clock named in the field (`t2` is the drone's, everything else the Uno's). Feed the files to `AFC-Drone/scripts/pendulum_sync.py` together with the drone's decoded SD log.
+
+```bash
+./start-dashboard.sh --serial-port /dev/ttyACM0 --pendulum-log test_logs
 ```
 
 The server may also be started manually:
@@ -349,6 +366,8 @@ Total frame size:
 | 6 | `LOG_STATUS` | Drone to dashboard | Exactly 36 bytes |
 | 7 | `LOG_CONTROL` | Dashboard to drone | 8–49 bytes |
 | 10 | `HEARTBEAT` | Dashboard to drone | Exactly 8 bytes, every 25 ms |
+| 20 | `BASE_TIMESYNC` | Base station to dashboard | Exactly 18 bytes, pendulum test only |
+| 21 | `BASE_MAG_PASS` | Base station to dashboard | Exactly 26 bytes, pendulum test only |
 
 Values 8 and 9 are unused. `HEARTBEAT` shares its number with the RF message so the same 8 bytes carry the same type id on both links. `LOG_STATUS` and `LOG_CONTROL` are USB only; over the radio they are carried as the RF messages below.
 
@@ -653,7 +672,7 @@ Run the JavaScript protocol tests with Node.js:
 
 ```bash
 node tests/protocol.test.mjs
-python -m unittest tests.test_framing   # from the repo root, in the virtualenv
+python -m unittest tests.test_framing tests.test_pendulum_log   # from the repo root, in the virtualenv
 ```
 
 The tests cover:

@@ -55,6 +55,10 @@ export const USB_MESSAGE_TYPES = Object.freeze({
   // the same 8 bytes carry the same type id on both links (AFC-Drone
   // include/usb.h - "Same as Radio").
   HEARTBEAT: 10,
+  // Pendulum timing test, sent by the base-station relay itself (never the
+  // drone). Logged to CSV by server.py --pendulum-log.
+  BASE_TIMESYNC: 20,
+  BASE_MAG_PASS: 21,
 });
 
 // RadioHead header-flags values used on the RF69 link itself (distinct from
@@ -76,6 +80,10 @@ export const RADIO_MESSAGE_TYPES = Object.freeze({
   LOG_STATUS1: 12,
   LOG_STATUS2: 13,
   LOG_CONTROL: 14,
+  // Clock sync with the base station (pendulum test). The relay handles
+  // these itself and does not forward them as RADIO_PACKETs.
+  TIME_PING: 15,
+  TIME_PONG: 16,
 });
 
 export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
@@ -94,6 +102,8 @@ export const RADIO_MESSAGE_TYPE_NAMES = Object.freeze({
   [RADIO_MESSAGE_TYPES.LOG_STATUS1]: 'Log Status1',
   [RADIO_MESSAGE_TYPES.LOG_STATUS2]: 'Log Status2',
   [RADIO_MESSAGE_TYPES.LOG_CONTROL]: 'Log Control',
+  [RADIO_MESSAGE_TYPES.TIME_PING]: 'Time Ping',
+  [RADIO_MESSAGE_TYPES.TIME_PONG]: 'Time Pong',
 });
 
 // The connection-identify handshake reuses USB_MESSAGE_TYPES.RAW, which no
@@ -847,6 +857,40 @@ export const PACKET_SCHEMAS = [
     builderHidden: true,
     encoder: (values) => encodeLogControlPayload(values, LOG_MARK_LABEL_MAX),
     decoder: decodeLogControlPayload,
+  },
+  {
+    id: USB_MESSAGE_TYPES.BASE_TIMESYNC,
+    name: 'Base Time Sync',
+    direction: 'in',
+    payloadSize: 18,
+    builderHidden: true,
+    fields: [
+      { key: 'seq', label: 'Ping seq', type: 'uint16' },
+      { key: 't1Us', label: 't1 base ping sent', type: 'uint32', unit: 'us' },
+      { key: 't2Us', label: 't2 drone ping received', type: 'uint32', unit: 'us' },
+      { key: 't4Us', label: 't4 base pong received', type: 'uint32', unit: 'us' },
+      { key: 'prevSeq', label: 'Earlier ping seq', type: 'uint8' },
+      { key: 'prevTxMinusRxUs', label: 'Its t3 - t2', type: 'uint16', unit: 'us' },
+      { key: 'rssi', label: 'RSSI magnitude', type: 'uint8', unit: 'dBm' },
+    ],
+  },
+  {
+    id: USB_MESSAGE_TYPES.BASE_MAG_PASS,
+    name: 'Base Magnet Pass',
+    direction: 'in',
+    payloadSize: 26,
+    builderHidden: true,
+    fields: [
+      { key: 'index', label: 'Pass', type: 'uint16' },
+      { key: 'centroidUs', label: 'Centroid (bottom)', type: 'uint32', unit: 'us' },
+      { key: 'startUs', label: 'Start', type: 'uint32', unit: 'us' },
+      { key: 'endUs', label: 'End', type: 'uint32', unit: 'us' },
+      { key: 'peakUs', label: 'Peak', type: 'uint32', unit: 'us' },
+      { key: 'peakRaw', label: 'Peak raw', type: 'int16' },
+      { key: 'baselineRaw', label: 'Baseline raw', type: 'int16' },
+      { key: 'samples', label: 'Samples', type: 'uint16' },
+      { key: 'maxGapUs', label: 'Longest sample gap', type: 'uint16', unit: 'us' },
+    ],
   },
   {
     id: USB_MESSAGE_TYPES.HEARTBEAT,

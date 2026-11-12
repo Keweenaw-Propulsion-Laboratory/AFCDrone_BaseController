@@ -19,6 +19,7 @@ from serial import SerialException
 from serial.tools import list_ports
 
 import framing
+from pendulum_log import PendulumLog
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger("aere-dashboard")
@@ -38,7 +39,7 @@ async def no_cache_middleware(request: web.Request, handler: Any) -> web.StreamR
 class SerialBridge:
     """Own one serial connection and broadcast received bytes to web clients."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, pendulum_dir: Path | None = None) -> None:
         self.loop = loop
         self.clients: set[web.WebSocketResponse] = set()
         self.serial: serial.Serial | None = None
@@ -73,6 +74,10 @@ class SerialBridge:
         # Tracks the drone's mode from its telemetry so the server can refuse
         # config and log changes in flight no matter which client asks.
         self.rx = framing.RxScanner()
+        # Pendulum timing test: base-station sync and pass events to CSV.
+        self.pendulum = PendulumLog(pendulum_dir) if pendulum_dir else None
+        if self.pendulum:
+            self.rx.on_frame = self.pendulum.on_frame
         # Last known config values, keyed by config key. Filled by whichever
         # client talks to the drone; served to everyone, including late joiners.
         self.config_cache: dict[int, int] = {}
@@ -402,6 +407,8 @@ class SerialBridge:
 
         self.rx.reset()
         self.last_echoed_heartbeat = None
+        if self.pendulum:
+            self.pendulum.start()
         self.serial = connection
         self.port = port
         self.baud_rate = baud_rate
@@ -438,6 +445,8 @@ class SerialBridge:
         self.link_mode = {"mode": None, "known": False}
         self.rx.reset()
         self.last_echoed_heartbeat = None
+        if self.pendulum:
+            self.pendulum.stop()
         if was_port:
             LOG.info("Disconnected serial port %s", was_port)
         if notify:
@@ -596,9 +605,9 @@ async def on_cleanup(app: web.Application) -> None:
     await bridge.disconnect(notify=False)
 
 
-def build_app(loop: asyncio.AbstractEventLoop) -> web.Application:
+def build_app(loop: asyncio.AbstractEventLoop, pendulum_dir: Path | None = None) -> web.Application:
     app = web.Application(middlewares=[no_cache_middleware])
-    app["bridge"] = SerialBridge(loop)
+    app["bridge"] = SerialBridge(loop, pendulum_dir)
     app.router.add_get("/", index_handler)
     app.router.add_get("/index.html", index_handler)
     app.router.add_get("/styles.css", stylesheet_handler)
@@ -614,7 +623,7 @@ def build_app(loop: asyncio.AbstractEventLoop) -> web.Application:
 
 async def run_server(args: argparse.Namespace) -> None:
     loop = asyncio.get_running_loop()
-    app = build_app(loop)
+    app = build_app(loop, args.pendulum_log)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, args.host, args.http_port)
@@ -638,6 +647,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--http-port", type=int, default=8000, help="HTTP port (default: 8000)")
     parser.add_argument("--serial-port", help="Serial port to open at startup, such as COM3 or /dev/ttyACM0")
     parser.add_argument("--baud", type=int, default=115200, help="Startup serial baud rate (default: 115200)")
+    parser.add_argument("--pendulum-log", type=Path, metavar="DIR",
+                        help="Write base-station pendulum-test events (clock sync, magnet passes) "
+                             "to CSV files in DIR, a new set per serial connection")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
